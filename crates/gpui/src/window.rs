@@ -4761,9 +4761,58 @@ impl Window {
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
+        path.texture = None;
         self.next_frame
             .scene
             .insert_primitive(path.scale(scale_factor));
+    }
+
+    /// Fill a path with frame zero of a caller-owned image on WGPU backends.
+    ///
+    /// The texture spans `path.bounds`, independent of the screen-space content
+    /// mask, and is linearly sampled with coordinates clamped to its texel centers.
+    /// Path antialiasing and element opacity are preserved. Keep the image alive
+    /// while paints can be replayed, and release its atlas entry with `drop_image`
+    /// under the same ownership rules as `paint_image`. Repeated calls reuse the
+    /// image's atlas tile. Native Metal backends return an unsupported error.
+    pub fn paint_path_with_texture(
+        &mut self,
+        mut path: Path<Pixels>,
+        texture: Arc<RenderImage>,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        anyhow::ensure!(
+            !cfg!(any(target_os = "macos", target_os = "ios")),
+            "textured paths require a WGPU backend"
+        );
+        anyhow::ensure!(
+            texture.frame_count() > 0,
+            "path texture has no image frames"
+        );
+        if path.bounds.is_empty() || path.vertices.is_empty() {
+            return Ok(());
+        }
+        let params = RenderImageParams {
+            image_id: texture.id,
+            frame_index: 0,
+        };
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(params.into(), &mut || {
+                Ok(Some((
+                    texture.size(0),
+                    Cow::Borrowed(texture.as_bytes(0).unwrap()),
+                )))
+            })?
+            .expect("Callback above only returns Some");
+        path.texture = Some(tile);
+        path.texture_opacity = self.element_opacity();
+        path.content_mask = self.content_mask();
+        let scale_factor = self.scale_factor();
+        self.next_frame
+            .scene
+            .insert_primitive(path.scale(scale_factor));
+        Ok(())
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -4972,6 +5021,8 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                transformation: TransformationMatrix::unit(),
             });
         }
         Ok(())
@@ -5059,7 +5110,36 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with_transformation(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            TransformationMatrix::unit(),
+        )
+    }
+
+    /// Paint an image with a device-space transformation after cropping and
+    /// rounding in local coordinates. The content mask remains screen-space.
+    /// Native Metal backends reject non-unit transformations.
+    pub fn paint_image_with_transformation(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        transformation: TransformationMatrix,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        anyhow::ensure!(
+            transformation == TransformationMatrix::unit(),
+            "image transformations require a WGPU backend"
+        );
 
         let visible_bounds = bounds.intersect(&image_bounds);
         if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
@@ -5144,6 +5224,8 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            transformation,
         });
         Ok(())
     }

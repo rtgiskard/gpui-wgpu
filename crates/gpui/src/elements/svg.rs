@@ -209,7 +209,7 @@ impl InteractiveElement for Svg {
     }
 }
 
-/// A transformation to apply to an SVG element.
+/// A transformation to apply to an SVG or image element.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transformation {
     scale: Size<f32>,
@@ -274,13 +274,37 @@ impl Transformation {
         self
     }
 
-    fn into_matrix(self, center: Point<Pixels>, scale_factor: f32) -> TransformationMatrix {
+    pub(crate) fn into_matrix(
+        self,
+        center: Point<Pixels>,
+        scale_factor: f32,
+    ) -> TransformationMatrix {
         //Note: if you read this as a sequence of matrix multiplications, start from the bottom
         TransformationMatrix::unit()
             .translate(center.scale(scale_factor) + self.translate.scale(scale_factor))
             .rotate(self.rotate)
             .scale(self.scale)
             .translate(center.scale(-scale_factor))
+    }
+}
+
+#[cfg(test)]
+mod transformation_tests {
+    use super::*;
+
+    #[test]
+    fn rotation_keeps_logical_center_at_device_scale() {
+        let center = point(px(10.0), px(20.0));
+        let matrix = Transformation::rotate(radians(std::f32::consts::FRAC_PI_2))
+            .with_translation(point(px(3.0), px(4.0)))
+            .into_matrix(center, 2.0);
+        // `apply` operates on the matrix's coordinates, which are device pixels here.
+        let transformed = matrix.apply(point(px(20.0), px(40.0)));
+        assert!((transformed.x.0 - 26.0).abs() < 0.0001);
+        assert!((transformed.y.0 - 48.0).abs() < 0.0001);
+        let top_left = matrix.apply(point(px(0.0), px(0.0)));
+        assert!((top_left.x.0 - 66.0).abs() < 0.0001);
+        assert!((top_left.y.0 - 28.0).abs() < 0.0001);
     }
 }
 

@@ -207,12 +207,16 @@ fn load_shadow(instance_id: u32) -> Shadow {
 }
 
 fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    var cursor = instance_cursor(vertex_id * 26u);
+    var cursor = instance_cursor(vertex_id * 36u);
     return PathRasterizationVertex(
         read_vec2_f32(&cursor),
         read_vec2_f32(&cursor),
         read_background(&cursor),
         read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_f32(&cursor),
+        read_f32(&cursor),
     );
 }
 
@@ -248,7 +252,7 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 }
 
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    var cursor = instance_cursor(instance_id * 24u);
+    var cursor = instance_cursor(instance_id * 30u);
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
@@ -258,5 +262,6 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_bounds(&cursor),
         read_corners(&cursor),
         read_atlas_tile(&cursor),
+        read_transformation(&cursor),
     );
 }

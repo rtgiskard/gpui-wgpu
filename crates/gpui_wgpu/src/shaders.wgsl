@@ -1052,6 +1052,10 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    texture_bounds: Bounds,
+    texture_tile_bounds: Bounds,
+    opacity: f32,
+    pad: f32,
 }
 
 
@@ -1076,6 +1080,33 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     return out;
 }
 
+fn path_coverage(st_position: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> f32 {
+    if (length(vec2<f32>(dx.x, dy.x)) < 0.001) {
+        return 1.0;
+    }
+    let gradient = 2.0 * st_position.xx * vec2<f32>(dx.x, dy.x) - vec2<f32>(dx.y, dy.y);
+    let f = st_position.x * st_position.x - st_position.y;
+    return saturate(0.5 - f / length(gradient));
+}
+
+@fragment
+fn fs_path_rasterization_textured(input: PathRasterizationVarying) -> @location(0) vec4<f32> {
+    let alpha = path_coverage(input.st_position, dpdx(input.st_position), dpdy(input.st_position));
+    let v = load_path_vertex(input.vertex_id);
+    let unit_position = clamp((input.position.xy - v.texture_bounds.origin) / v.texture_bounds.size,
+        vec2<f32>(0.0), vec2<f32>(1.0));
+    let tile_min = v.texture_tile_bounds.origin + vec2<f32>(0.5);
+    let tile_max = v.texture_tile_bounds.origin + v.texture_tile_bounds.size - vec2<f32>(0.5);
+    let tile_position = clamp(v.texture_tile_bounds.origin + unit_position * v.texture_tile_bounds.size,
+        tile_min, tile_max) / vec2<f32>(textureDimensions(t_sprite, 0));
+    let color = textureSampleLevel(t_sprite, s_sprite, tile_position, 0.0);
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let coverage = color.a * alpha * v.opacity;
+    return vec4<f32>(color.rgb * coverage, coverage);
+}
+
 @fragment
 fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f32> {
     let dx = dpdx(input.st_position);
@@ -1088,16 +1119,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     let background = v.color;
     let bounds = v.bounds;
 
-    var alpha: f32;
-    if (length(vec2<f32>(dx.x, dy.x)) < 0.001) {
-        // If the gradient is too small, return a solid color.
-        alpha = 1.0;
-    } else {
-        let gradient = 2.0 * input.st_position.xx * vec2<f32>(dx.x, dy.x) - vec2<f32>(dx.y, dy.y);
-        let f = input.st_position.x * input.st_position.x - input.st_position.y;
-        let distance = f / length(gradient);
-        alpha = saturate(0.5 - distance);
-    }
+    let alpha = path_coverage(input.st_position, dx, dy);
     let prepared_gradient = prepare_gradient_color(
         background.tag,
         background.color_space,
@@ -1268,6 +1290,7 @@ struct PolychromeSprite {
     content_mask: Bounds,
     corner_radii: Corners,
     tile: AtlasTile,
+    transformation: TransformationMatrix,
 }
 
 
@@ -1276,6 +1299,7 @@ struct PolySpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) sprite_id: u32,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) local_position: vec2<f32>,
 }
 
 @vertex
@@ -1284,10 +1308,11 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     let sprite = load_poly_sprite(instance_id);
 
     var out = PolySpriteVarying();
-    out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.local_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
     return out;
 }
 
@@ -1300,7 +1325,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     }
 
     let sprite = load_poly_sprite(input.sprite_id);
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let distance = quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
 
     var color = sample;
     if (sprite.grayscale != 0u) {

@@ -86,9 +86,14 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
+        let bounds = match &primitive {
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.transformation.apply_bounds(sprite.bounds)
+            }
+            _ => *primitive.bounds(),
+        };
+        let clipped_bounds = bounds.intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
             return;
@@ -697,6 +702,39 @@ impl TransformationMatrix {
         }
         Point::new(output[0].into(), output[1].into())
     }
+
+    /// Axis-aligned device-space bounds after applying this transformation.
+    pub fn apply_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        if *self == Self::unit() {
+            return bounds;
+        }
+        let x = bounds.origin.x.0;
+        let y = bounds.origin.y.0;
+        let right = x + bounds.size.width.0;
+        let bottom = y + bounds.size.height.0;
+        let corners = [[x, y], [right, y], [x, bottom], [right, bottom]].map(|p| {
+            [
+                self.rotation_scale[0][0] * p[0]
+                    + self.rotation_scale[0][1] * p[1]
+                    + self.translation[0],
+                self.rotation_scale[1][0] * p[0]
+                    + self.rotation_scale[1][1] * p[1]
+                    + self.translation[1],
+            ]
+        });
+        let mut min = corners[0];
+        let mut max = corners[0];
+        for corner in &corners[1..] {
+            for axis in 0..2 {
+                min[axis] = min[axis].min(corner[axis]);
+                max[axis] = max[axis].max(corner[axis]);
+            }
+        }
+        Bounds {
+            origin: point(ScaledPixels(min[0]), ScaledPixels(min[1])),
+            size: Size::new(ScaledPixels(max[0] - min[0]), ScaledPixels(max[1] - min[1])),
+        }
+    }
 }
 
 impl Default for TransformationMatrix {
@@ -755,6 +793,8 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub transformation: TransformationMatrix,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -793,6 +833,10 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub content_mask: ContentMask<P>,
     pub vertices: Vec<PathVertex<P>>,
     pub color: Background,
+    /// Atlas tile used as a normalized fill texture, when present.
+    pub texture: Option<AtlasTile>,
+    /// Element opacity for a textured fill.
+    pub texture_opacity: f32,
     start: Point<P>,
     current: Point<P>,
     contour_count: usize,
@@ -813,6 +857,8 @@ impl Path<Pixels> {
             },
             content_mask: Default::default(),
             color: Default::default(),
+            texture: None,
+            texture_opacity: 1.0,
             contour_count: 0,
         }
     }
@@ -833,6 +879,8 @@ impl Path<Pixels> {
             current: self.current.scale(factor),
             contour_count: self.contour_count,
             color: self.color,
+            texture: self.texture,
+            texture_opacity: self.texture_opacity,
         }
     }
 
