@@ -268,7 +268,7 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
-            let now = Instant::now();
+            let now = cx.background_executor().now();
             let initial = self.initial.unwrap_or(self.target);
             let mut state = state.unwrap_or_else(|| SpringElementState {
                 spring: SpringState {
@@ -400,7 +400,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
             let mut state = state.unwrap_or_else(|| AnimationState {
-                start: Instant::now(),
+                start: cx.background_executor().now(),
                 animation_ix: 0,
                 delayed_frame_pending: Rc::new(Cell::new(false)),
             });
@@ -421,7 +421,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                     // Reduce modulo the duration before f32 conversion, which loses sub-second precision at scale.
                     Duration::from_nanos((elapsed.as_nanos() % duration.as_nanos()) as u64)
                 } else {
-                    state.start.elapsed()
+                    cx.background_executor().now() - state.start
                 };
                 let mut delta = elapsed.as_secs_f32() / duration.as_secs_f32();
 
@@ -431,7 +431,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
                         if animation_ix >= self.animations.len() - 1 {
                             done = true;
                         } else {
-                            state.start = Instant::now();
+                            state.start = cx.background_executor().now();
                             state.animation_ix += 1;
                         }
                         delta = 1.0;
@@ -629,8 +629,6 @@ mod tests {
     impl Render for AnimationTestView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let rendered_deltas = self.rendered_deltas.clone();
-            // The throttled variant syncs to the shared clock so the deltas
-            // follow the test scheduler's clock rather than wall time.
             let mut animation = Animation::new(Duration::from_secs(1));
             if let Some(max_fps) = self.max_fps {
                 animation = animation.repeat_synced().with_max_fps(max_fps);
@@ -677,6 +675,54 @@ mod tests {
         cx.run_until_parked();
         callback_count
     }
+
+    #[gpui::test]
+    fn test_repeating_animation_uses_executor_clock(cx: &mut TestAppContext) {
+        let (deltas, window) = open_test_window(cx);
+        assert_eq!(*deltas.borrow().last().unwrap(), 0.);
+        cx.executor().advance_clock(Duration::from_millis(250));
+        assert!(simulate_next_frame(&window, cx) > 0);
+        assert!((*deltas.borrow().last().unwrap() - 0.25).abs() < 1e-2);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        assert!(simulate_next_frame(&window, cx) > 0);
+        assert!((*deltas.borrow().last().unwrap() - 0.25).abs() < 1e-2);
+    }
+
+    #[gpui::test]
+    fn test_chained_animation_resets_with_executor_clock(cx: &mut TestAppContext) {
+        struct ChainedAnimationTestView(Rc<RefCell<Vec<(usize, f32)>>>);
+
+        impl Render for ChainedAnimationTestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let deltas = self.0.clone();
+                div().with_animations(
+                    "chained-animation",
+                    vec![Animation::new(Duration::from_secs(1)); 2],
+                    move |this, index, delta| {
+                        deltas.borrow_mut().push((index, delta));
+                        this
+                    },
+                )
+            }
+        }
+
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.open_window(size(px(100.), px(100.)), {
+            let deltas = deltas.clone();
+            move |_, _| ChainedAnimationTestView(deltas)
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(1100));
+        assert!(simulate_next_frame(&window, cx) > 0);
+        assert_eq!(*deltas.borrow().last().unwrap(), (0, 1.));
+        cx.executor().advance_clock(Duration::from_millis(250));
+        assert!(simulate_next_frame(&window, cx) > 0);
+        let (index, delta) = *deltas.borrow().last().unwrap();
+        assert_eq!(index, 1);
+        assert!((delta - 0.25).abs() < 1e-2);
+    }
+
+
     // Before parent-animation-element, using .with_animation
     // would not allow chaining .parent after. This is just a
     // build check that we can call div().id().with_animation().child()
