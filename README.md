@@ -74,6 +74,7 @@ The support-crate baseline remains `df48a139ce9c292738b523252c12f044697e673f`.
 | `99e70ee4a0` | Executor-clock animation timing |
 | `2a74c8dff6` | Removed unused hash-layout APIs and cache state; ordinary and wrapped replay retained |
 | `772a8a9100` | Window-local Rc/RefCell text caches and font-run scratch; shared font state remains synchronized |
+| `b488c4e814` | Taffy 0.15 measurement/alignment API migration, retaining device-pixel snapping and relative positioning |
 
 The WGPU migration changes presentation and mapped-buffer APIs, including local
 material uploads and readback. Consumers must update their lockfile when adopting
@@ -81,7 +82,8 @@ this patch set. `Window::text_system()` now returns `&Rc<WindowTextSystem>`;
 consumers explicitly storing that handle must use Rc and keep it on the UI thread.
 The unused hash-layout APIs have been removed. Font-generation invalidation and
 ordinary/wrapped double-frame cache reclamation remain in place. Platform/input/
-scheduler migrations, hot reload and the Taffy upgrade are deferred.
+scheduler migrations and hot reload are deferred. Taffy is pinned to 0.15.0;
+layout consumers should verify grid/flex sizing and measured content when updating.
 
 ## Development
 
