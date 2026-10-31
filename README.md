@@ -38,6 +38,46 @@ Unmodified platform and support crates still come from the pinned Zed revision.
 Keep both patched crates on the same commit and review Rust/shader layouts,
 composition order and resource lifetimes together when updating upstream.
 
+## Upstream tracking
+
+Support and platform crates remain pinned to the baseline above. Backport selected
+fixes rather than replacing these two crates with upstream HEAD: renderer resource
+retirement, material uploads and transformed sprites have local contracts that must
+survive each update. Sprite record layouts must also remain compatible with the
+pinned platform renderers; texture batching can be updated without changing ABI.
+
+Consumers should pin both crates to the same full commit during development.
+Immutable release tags mark integration-tested milestones of this patch set,
+independently of Rivu's version; the `upstream/*` tags identify source snapshots,
+not supported releases. A consumer's lockfile records the exact adopted revision.
+
+For each upstream review, record the scanned Zed commit and the disposition of
+candidate patches. Advancing that scan point does not advance the dependency
+baseline: platform and support API migrations require a separate coordinated update.
+
+### Reviewed upstream changes
+
+Last scanned Zed revision: `ba63a022c9a22ca66d68ef2a8f0bb9b5b0a9984d`.
+The support-crate baseline remains `df48a139ce9c292738b523252c12f044697e673f`.
+
+| Upstream commits | Disposition |
+| --- | --- |
+| `2529740084` | Arena ownership isolation, retaining local nested-draw reclamation |
+| `e4a3732b94` | Cache-only line-wrapper pooling, retaining checkout-safe reclamation |
+| `8fa085e397` | Inherited-opacity cache invalidation and paint-time correction |
+| `e18de65b75` | WGPU path source-over alpha; other platform renderers unchanged |
+| `402675e805`, `24a2823456` | WGPU and Naga migration to `cddb2f5d80dc0009b2ef6767635140cacf90a007` |
+| `e20d19d32f` | Single surface configuration, retaining local backend selection |
+| `b4ecc45422` | Texture-index sprite sorting only; record layout changes deferred |
+| `3389d87577`, `b7d50b95e8` | Resolved-font caching and explicit-request warnings |
+| `370591f3d1` | Deferred native-close cleanup |
+| `99e70ee4a0` | Executor-clock animation timing |
+
+The WGPU migration changes presentation and mapped-buffer APIs, including local
+material uploads and readback. Consumers must update their lockfile when adopting
+this patch set. Public text-system ownership changes, hash-layout API removal,
+platform/input/scheduler migrations, hot reload and the Taffy upgrade are deferred.
+
 ## Development
 
 Use the pinned Rust toolchain. Linux builds need a C/C++ toolchain, pkg-config and
