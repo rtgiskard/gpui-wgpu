@@ -1250,6 +1250,21 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 
 // --- polychrome sprites --- //
 
+struct ImageEffects {
+    linear_fade_start: f32,
+    linear_fade_end: f32,
+    linear_fade_angle: f32,
+    radial_fade_start: f32,
+    radial_fade_end: f32,
+    blur_radius: f32,
+    wave_amplitude: f32,
+    wave_frequency: f32,
+    wave_phase: f32,
+    grain: f32,
+    grain_scale: f32,
+    posterize_levels: f32,
+}
+
 struct PolychromeSprite {
     order: u32,
     pad: u32,
@@ -1260,6 +1275,8 @@ struct PolychromeSprite {
     corner_radii: Corners,
     tile: AtlasTile,
     transformation: TransformationMatrix,
+    source_tile_bounds: AtlasBounds,
+    effects: ImageEffects,
 }
 
 
@@ -1285,15 +1302,99 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     return out;
 }
 
+// Interpolate in premultiplied space so transparent source RGB cannot fringe.
+// Clamp before conversion to integer coordinates: no tap may leave this tile.
+fn image_premultiplied_texel(position: vec2<i32>) -> vec4<f32> {
+    let color = textureLoad(t_sprite, position, 0);
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+
+fn image_premultiplied_sample(position: vec2<f32>, bounds: AtlasBounds) -> vec4<f32> {
+    let maximum = bounds.origin + max(bounds.size, vec2<i32>(1)) - vec2<i32>(1);
+    let texel = clamp(position - vec2<f32>(0.5), vec2<f32>(bounds.origin), vec2<f32>(maximum));
+    let base = vec2<i32>(floor(texel));
+    let next = min(base + vec2<i32>(1), maximum);
+    let fraction = fract(texel);
+    var top = image_premultiplied_texel(base);
+    if (fraction.x > 0.0) {
+        top = mix(top, image_premultiplied_texel(vec2<i32>(next.x, base.y)), fraction.x);
+    }
+    // Exact texel centers and clamped/one-pixel axes need no duplicate loads.
+    if (fraction.y == 0.0) {
+        return top;
+    }
+    var bottom = image_premultiplied_texel(vec2<i32>(base.x, next.y));
+    if (fraction.x > 0.0) {
+        bottom = mix(bottom, image_premultiplied_texel(next), fraction.x);
+    }
+    return mix(top, bottom, fraction.y);
+}
+
+fn image_straight_alpha(color: vec4<f32>) -> vec4<f32> {
+    if (color.a > 0.0) {
+        return vec4<f32>(color.rgb / color.a, color.a);
+    }
+    return vec4<f32>(0.0);
+}
+
+fn image_reflect(position: vec2<f32>, bounds: AtlasBounds) -> vec2<f32> {
+    let minimum = vec2<f32>(bounds.origin) + vec2<f32>(0.5);
+    let extent = max(vec2<f32>(bounds.size) - vec2<f32>(1.0), vec2<f32>(0.000001));
+    // Triangular repeat is continuous at both boundaries, including negative UVs.
+    return minimum + (vec2<f32>(1.0) - abs(fract((position - minimum) / (2.0 * extent)) * 2.0 - vec2<f32>(1.0))) * extent;
+}
+
+fn image_effect_sample(sprite: PolychromeSprite, position: vec2<f32>, local_uv: vec2<f32>) -> vec4<f32> {
+    var center = position;
+    let texels_per_pixel = vec2<f32>(sprite.tile.bounds.size) / max(sprite.bounds.size, vec2<f32>(0.000001));
+    if (sprite.effects.wave_amplitude != 0.0) {
+        center.x += sprite.effects.wave_amplitude * texels_per_pixel.x * sin(local_uv.y * 2.0 * M_PI_F * sprite.effects.wave_frequency + sprite.effects.wave_phase);
+        center = image_reflect(center, sprite.source_tile_bounds);
+    }
+    var result = vec4<f32>(0.0);
+    if (sprite.effects.blur_radius > 0.0) {
+        // Fixed 9x9 Gaussian quadrature over +/-3 sigma. Bounded 324 texel
+        // reads; no offscreen texture, source decode or per-frame image upload.
+        let weights = array<f32, 9>(0.0033257271, 0.0238179220, 0.0971919923, 0.2259781525, 0.2993724122, 0.2259781525, 0.0971919923, 0.0238179220, 0.0033257271);
+        for (var y = -4; y <= 4; y += 1) {
+            for (var x = -4; x <= 4; x += 1) {
+                let offset = vec2<f32>(f32(x), f32(y)) * 0.25;
+                let weight = weights[u32(x + 4)] * weights[u32(y + 4)];
+                var sample_position = center + offset * sprite.effects.blur_radius * texels_per_pixel;
+                if (sprite.effects.wave_amplitude != 0.0) {
+                    sample_position = image_reflect(sample_position, sprite.source_tile_bounds);
+                }
+                result += image_premultiplied_sample(sample_position, sprite.source_tile_bounds) * weight;
+            }
+        }
+    } else {
+        result = image_premultiplied_sample(center, sprite.source_tile_bounds);
+    }
+    return image_straight_alpha(result);
+}
+
+fn image_feather(effects: ImageEffects, uv: vec2<f32>) -> f32 {
+    var alpha = 1.0;
+    if (effects.linear_fade_end > effects.linear_fade_start) {
+        let direction = vec2<f32>(cos(effects.linear_fade_angle), sin(effects.linear_fade_angle));
+        let projection = dot(uv - vec2<f32>(0.5), direction) / (abs(direction.x) + abs(direction.y)) + 0.5;
+        alpha *= 1.0 - smoothstep(effects.linear_fade_start, effects.linear_fade_end, projection);
+    }
+    if (effects.radial_fade_end > effects.radial_fade_start) {
+        alpha *= 1.0 - smoothstep(effects.radial_fade_start, effects.radial_fade_end, length((uv - vec2<f32>(0.5)) * 2.0));
+    }
+    return alpha;
+}
+
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let sprite = load_poly_sprite(input.sprite_id);
     let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
     let tile_min = (vec2<f32>(sprite.tile.bounds.origin) + vec2<f32>(0.5)) / atlas_size;
-    let tile_max = (vec2<f32>(sprite.tile.bounds.origin) + vec2<f32>(sprite.tile.bounds.size) - vec2<f32>(0.5)) / atlas_size;
+    let tile_max = max(tile_min, (vec2<f32>(sprite.tile.bounds.origin) + vec2<f32>(sprite.tile.bounds.size) - vec2<f32>(0.5)) / atlas_size);
     // Linear filtering must not read neighboring atlas tiles, even for one-pixel images.
     let tile_position = clamp(input.tile_position, tile_min, tile_max);
-    let sample = textureSample(t_sprite, s_sprite, tile_position);
+    let local_uv = (input.local_position - sprite.bounds.origin) / max(sprite.bounds.size, vec2<f32>(0.000001));
     let half_size = sprite.bounds.size * 0.5;
     let center_to_point = input.local_position - (sprite.bounds.origin + half_size);
     let radius = pick_corner_radius(center_to_point, sprite.corner_radii);
@@ -1312,8 +1413,26 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let distance_per_pixel = length(vec2<f32>(dot(normal, local_dx), dot(normal, local_dy)));
     let coverage = saturate(0.5 - distance / max(distance_per_pixel, 0.000001));
     // Alpha clip after using the derivatives.
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
+    if (any(input.clip_distances < vec4<f32>(0.0)) || coverage <= 0.0) {
         return vec4<f32>(0.0);
+    }
+    let feather = image_feather(sprite.effects, local_uv);
+    if (feather <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    var sample: vec4<f32>;
+    if (sprite.effects.blur_radius > 0.0 || sprite.effects.wave_amplitude != 0.0) {
+        sample = image_effect_sample(sprite, input.tile_position * atlas_size, local_uv);
+    } else {
+        sample = textureSampleLevel(t_sprite, s_sprite, tile_position, 0.0);
+        // Preserve ordinary image sampling. Active source effects need alpha-
+        // correct interpolation; their opaque samples still take this fast path.
+        let effects_active = sprite.effects.linear_fade_end > sprite.effects.linear_fade_start
+            || sprite.effects.radial_fade_end > sprite.effects.radial_fade_start
+            || sprite.effects.posterize_levels >= 2.0 || sprite.effects.grain > 0.0;
+        if (effects_active && sample.a > 0.0 && sample.a < 1.0) {
+            sample = image_straight_alpha(image_premultiplied_sample(tile_position * atlas_size, sprite.tile.bounds));
+        }
     }
 
     var color = sample;
@@ -1321,7 +1440,19 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * coverage);
+    if (sprite.effects.posterize_levels >= 2.0) {
+        let steps = sprite.effects.posterize_levels - 1.0;
+        color = vec4<f32>(floor(color.rgb * steps + vec3<f32>(0.5)) / steps, color.a);
+    }
+    if (sprite.effects.grain > 0.0) {
+        let cell = vec2<u32>(max(floor((input.local_position - sprite.bounds.origin) / max(sprite.effects.grain_scale, 1.0)), vec2<f32>(0.0)));
+        var hash = cell.x * 1664525u + cell.y * 1013904223u + 374761393u;
+        hash = (hash ^ (hash >> 13u)) * 1274126177u;
+        hash ^= hash >> 16u;
+        let noise = f32(hash & 65535u) / 65535.0 - 0.5;
+        color = vec4<f32>(clamp(color.rgb + vec3<f32>(noise * sprite.effects.grain), vec3<f32>(0.0), vec3<f32>(1.0)), color.a);
+    }
+    return blend_color(color, sprite.opacity * coverage * feather);
 }
 
 // --- surfaces --- //

@@ -1,9 +1,9 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Transformation, Window,
-    decode_static_image, decode_webp_image, px,
+    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageEffects, InspectorElementId,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
+    RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Transformation,
+    Window, decode_static_image, decode_webp_image, px,
 };
 use anyhow::Result;
 
@@ -193,6 +193,7 @@ pub struct Img {
     image_cache: Option<AnyImageCache>,
     transformation: Option<Transformation>,
     automatic_animation_frames: bool,
+    effects: ImageEffects,
 }
 
 /// Create a new image element.
@@ -205,6 +206,7 @@ pub fn img(source: impl Into<ImageSource>) -> Img {
         image_cache: None,
         transformation: None,
         automatic_animation_frames: true,
+        effects: ImageEffects::default(),
     }
 }
 
@@ -216,6 +218,14 @@ impl Img {
     /// still advances on those redraws; this does not pause the source animation.
     pub fn with_automatic_animation_frames(mut self, automatic: bool) -> Self {
         self.automatic_animation_frames = automatic;
+        self
+    }
+
+    /// Compose source-image feathers, blur, continuous waves, grain and quantization.
+    ///
+    /// Requires WGPU. Defaults preserve normal image rendering and image caching.
+    pub fn with_effects(mut self, effects: ImageEffects) -> Self {
+        self.effects = effects;
         self
     }
 
@@ -555,7 +565,7 @@ impl Element for Img {
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
                     window
-                        .paint_image_with_transformation(
+                        .paint_image_with_effects(
                             bounds,
                             new_bounds,
                             corner_radii,
@@ -563,6 +573,7 @@ impl Element for Img {
                             layout_state.frame_index,
                             self.style.grayscale,
                             self.transformation,
+                            self.effects,
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {
@@ -1099,7 +1110,14 @@ mod tests {
                 "showing an animated image must restore animation demand",
             );
             window.update(|window, _| {
-                assert!(window.rendered_frame.scene.polychrome_sprites.last().is_some());
+                assert!(
+                    window
+                        .rendered_frame
+                        .scene
+                        .polychrome_sprites
+                        .last()
+                        .is_some()
+                );
             });
         }
     }
@@ -1130,7 +1148,10 @@ mod tests {
                 window.simulate_next_frame(cx)
             })
             .unwrap();
-        assert_eq!(requests, 0, "hover-hidden image must not request another frame");
+        assert_eq!(
+            requests, 0,
+            "hover-hidden image must not request another frame"
+        );
 
         let requests = cx
             .update_window(window.into(), |_, window, cx| {
@@ -1140,7 +1161,10 @@ mod tests {
                 window.simulate_next_frame(cx)
             })
             .unwrap();
-        assert!(requests > 0, "leaving the image must restore animation demand");
+        assert!(
+            requests > 0,
+            "leaving the image must restore animation demand"
+        );
     }
 
     #[gpui::test]
@@ -1163,11 +1187,16 @@ mod tests {
         window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
             view.clone().into_any_element()
         });
-        assert_eq!(window.update(|window, cx| window.simulate_next_frame(cx)), 1);
+        assert_eq!(
+            window.update(|window, cx| window.simulate_next_frame(cx)),
+            1
+        );
     }
 
     #[gpui::test]
-    fn image_and_resource_sources_decode_webp_pixels_and_delays_identically(cx: &mut TestAppContext) {
+    fn image_and_resource_sources_decode_webp_pixels_and_delays_identically(
+        cx: &mut TestAppContext,
+    ) {
         // Non-square frames with EXIF Orientation 6 must rotate clockwise.
         let animated_frames: &[(&[u8], u64)] = &[
             (&[0x77, 0x22, 0x11, 0x80, 0xC3, 0xB2, 0xA1, 0xD0], 70),
@@ -1203,7 +1232,11 @@ mod tests {
             for decoded in [image_decoded, resource_decoded] {
                 assert_eq!(decoded.frame_count(), expected_frames.len(), "{fixture}");
                 for (index, (pixel, delay_ms)) in expected_frames.iter().enumerate() {
-                    assert_eq!(decoded.size(index), expected_size, "{fixture} frame {index}");
+                    assert_eq!(
+                        decoded.size(index),
+                        expected_size,
+                        "{fixture} frame {index}"
+                    );
                     assert_eq!(
                         decoded.as_bytes(index).unwrap(),
                         *pixel,
@@ -1376,6 +1409,65 @@ mod tests {
                 assert!((f32::from(rotated.x) - f32::from(center.x)).abs() < 0.001);
                 assert!((f32::from(rotated.y) - f32::from(center.y)).abs() < 0.001);
             });
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[gpui::test]
+    fn composed_image_effects_reuse_source_tile_and_preserve_crop(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let image = test_image_with_size(200, 100);
+        let effects = ImageEffects {
+            linear_fade_start: 0.4,
+            linear_fade_end: 1.0,
+            radial_fade_start: 0.6,
+            radial_fade_end: 1.0,
+            blur_radius: 12.0,
+            wave_amplitude: 8.0,
+            wave_frequency: 2.0,
+            grain: 0.08,
+            grain_scale: 2.0,
+            posterize_levels: 6.0,
+            ..Default::default()
+        };
+        let mut baseline = None;
+        for active in [false, true] {
+            window.draw(point(px(10.), px(20.)), size(px(100.), px(100.)), |_, _| {
+                img(ImageSource::Render(image.clone()))
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .rounded(px(20.0))
+                    .with_effects(if active {
+                        effects
+                    } else {
+                        ImageEffects::default()
+                    })
+                    .into_any_element()
+            });
+            let (sprite, scale) = window.update(|window, _| {
+                (
+                    *window
+                        .rendered_frame
+                        .scene
+                        .polychrome_sprites
+                        .last()
+                        .unwrap(),
+                    window.scale_factor(),
+                )
+            });
+            if let Some(original) = baseline {
+                let original: crate::PolychromeSprite = original;
+                assert_eq!(sprite.tile, original.tile);
+                assert_eq!(sprite.bounds, original.bounds);
+                assert_eq!(sprite.content_mask, original.content_mask);
+                assert_eq!(sprite.corner_radii, original.corner_radii);
+                assert_eq!(sprite.transformation, original.transformation);
+                assert_eq!(sprite.source_tile_bounds, original.source_tile_bounds);
+                assert!(sprite.source_tile_bounds.size.width > sprite.tile.bounds.size.width);
+                assert_eq!(sprite.effects, effects.scaled(scale));
+            } else {
+                baseline = Some(sprite);
+            }
         }
     }
 

@@ -915,6 +915,144 @@ impl From<SubpixelSprite> for Primitive {
     }
 }
 
+/// Fixed, independently composable source-image effects for WGPU image sprites.
+///
+/// Defaults leave the original image untouched. Effects run on the cached atlas
+/// image, before opacity, rounded clipping and the element transformation; they
+/// never decode or upload a derived bitmap. Native Metal does not support them.
+/// Non-finite fields use zero (disabled/default); grain cells remain at least
+/// one device pixel. Length limits are applied before device scaling.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct ImageEffects {
+    /// Start of the opaque-to-transparent linear feather in normalized coordinates.
+    pub linear_fade_start: f32,
+    /// End of the linear feather; `end <= start` disables it.
+    pub linear_fade_end: f32,
+    /// Linear feather direction in radians (zero points right, PI/2 down).
+    pub linear_fade_angle: f32,
+    /// Start of the radial feather (zero at center, one at ellipse boundary).
+    pub radial_fade_start: f32,
+    /// End of the radial feather; `end <= start` disables it.
+    pub radial_fade_end: f32,
+    /// Gaussian sampling support radius in logical pixels, clamped to 0..32.
+    pub blur_radius: f32,
+    /// Horizontal sine-wave displacement in logical pixels; zero disables it.
+    pub wave_amplitude: f32,
+    /// Continuous wave cycles across the visible image height.
+    pub wave_frequency: f32,
+    /// Wave phase in radians. Callers animate this explicitly if desired.
+    pub wave_phase: f32,
+    /// Stable monochromatic paper grain strength in 0..1; zero disables it.
+    pub grain: f32,
+    /// Grain cell size in logical pixels (at least one device pixel).
+    pub grain_scale: f32,
+    /// Quantized RGB levels per channel; values below two disable quantization.
+    pub posterize_levels: f32,
+}
+
+impl ImageEffects {
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub(crate) fn scaled(self, scale: f32) -> Self {
+        fn finite_or_zero(value: f32) -> f32 {
+            if value.is_finite() { value } else { 0.0 }
+        }
+
+        Self {
+            linear_fade_start: finite_or_zero(self.linear_fade_start),
+            linear_fade_end: finite_or_zero(self.linear_fade_end),
+            linear_fade_angle: finite_or_zero(self.linear_fade_angle),
+            radial_fade_start: finite_or_zero(self.radial_fade_start),
+            radial_fade_end: finite_or_zero(self.radial_fade_end),
+            blur_radius: finite_or_zero(finite_or_zero(self.blur_radius).clamp(0.0, 32.0) * scale),
+            wave_amplitude: finite_or_zero(self.wave_amplitude * scale),
+            wave_frequency: finite_or_zero(self.wave_frequency),
+            wave_phase: finite_or_zero(self.wave_phase),
+            grain: finite_or_zero(self.grain).clamp(0.0, 1.0),
+            grain_scale: finite_or_zero(self.grain_scale * scale).max(1.0),
+            posterize_levels: if self.posterize_levels.is_finite() && self.posterize_levels >= 2.0 {
+                self.posterize_levels.round().min(256.0)
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "macos", target_os = "ios"))))]
+mod image_effect_tests {
+    use super::ImageEffects;
+
+    #[test]
+    fn image_effect_lengths_scale_once_and_preserve_dimensionless_settings() {
+        let effects = ImageEffects {
+            linear_fade_start: 0.2,
+            linear_fade_end: 0.8,
+            linear_fade_angle: 0.7,
+            radial_fade_start: 0.3,
+            radial_fade_end: 1.2,
+            blur_radius: 48.0,
+            wave_amplitude: -6.0,
+            wave_frequency: 2.5,
+            wave_phase: -1.0,
+            grain: 0.4,
+            grain_scale: 4.0,
+            posterize_levels: 5.6,
+        };
+        assert_eq!(
+            effects.scaled(1.5),
+            ImageEffects {
+                blur_radius: 48.0,
+                wave_amplitude: -9.0,
+                grain_scale: 6.0,
+                posterize_levels: 6.0,
+                ..effects
+            }
+        );
+        assert_eq!(
+            ImageEffects::default().scaled(2.0),
+            ImageEffects {
+                grain_scale: 1.0,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn nonfinite_image_effects_do_not_reach_the_shader() {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let effects = ImageEffects {
+                linear_fade_start: invalid,
+                linear_fade_end: invalid,
+                linear_fade_angle: invalid,
+                radial_fade_start: invalid,
+                radial_fade_end: invalid,
+                blur_radius: invalid,
+                wave_amplitude: invalid,
+                wave_frequency: invalid,
+                wave_phase: invalid,
+                grain: invalid,
+                grain_scale: invalid,
+                posterize_levels: invalid,
+            };
+            assert_eq!(
+                effects.scaled(2.0),
+                ImageEffects {
+                    grain_scale: 1.0,
+                    ..Default::default()
+                }
+            );
+        }
+        let overflow = ImageEffects {
+            wave_amplitude: f32::MAX,
+            grain_scale: f32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(overflow.scaled(2.0).wave_amplitude, 0.0);
+        assert_eq!(overflow.scaled(2.0).grain_scale, 1.0);
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -929,6 +1067,10 @@ pub struct PolychromeSprite {
     pub tile: AtlasTile,
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub transformation: TransformationMatrix,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub source_tile_bounds: Bounds<crate::DevicePixels>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub effects: ImageEffects,
 }
 
 impl From<PolychromeSprite> for Primitive {

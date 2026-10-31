@@ -697,7 +697,7 @@ mod tests {
             tile,
             transformation: TransformationMatrix::default(),
         };
-        let color = |tile, x| PolychromeSprite {
+        let color = |tile: gpui::AtlasTile, x| PolychromeSprite {
             order: 0,
             pad: 0,
             grayscale: false.into(),
@@ -708,6 +708,10 @@ mod tests {
             tile,
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             transformation: TransformationMatrix::default(),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            source_tile_bounds: tile.bounds,
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            effects: gpui::ImageEffects::default(),
         };
         let assert_pixel = |image: &image::RgbaImage, x, expected: [u8; 4]| {
             let actual = image.get_pixel(x, 16).0;

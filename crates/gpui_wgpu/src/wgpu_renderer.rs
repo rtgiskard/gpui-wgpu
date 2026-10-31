@@ -3792,6 +3792,8 @@ mod tests {
                 corner_radii: Corners::default(),
                 tile,
                 transformation: gpui::TransformationMatrix::default(),
+                source_tile_bounds: tile.bounds,
+                effects: gpui::ImageEffects::default(),
             });
             scene.finish();
             let image = renderer.render_scene_to_image(&scene, device_size(64, 32))?;
@@ -3805,6 +3807,307 @@ mod tests {
                 assert_pixel(&image, 32, 16, [0, 124, 131, 255]);
             }
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn image_effect_scene(tile: gpui::AtlasTile, effects: gpui::ImageEffects) -> Scene {
+        let bounds = solid_quad(0.0, 0.0, 64.0, 64.0, gpui::white()).bounds;
+        let mut scene = Scene::default();
+        scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false.into(),
+            opacity: 1.0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
+            tile,
+            transformation: gpui::TransformationMatrix::default(),
+            source_tile_bounds: tile.bounds,
+            effects,
+        });
+        scene.finish();
+        scene
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_image_effects_ignore_hidden_rgb_without_changing_plain_sampling() -> anyhow::Result<()>
+    {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let blue_hidden = image_tile(&renderer, 811, 2, 1, &[0, 0, 255, 255, 255, 0, 0, 0])?;
+        let green_hidden = image_tile(&renderer, 812, 2, 1, &[0, 0, 255, 255, 0, 255, 0, 0])?;
+        let effects = [
+            gpui::ImageEffects {
+                linear_fade_end: 1.0,
+                ..Default::default()
+            },
+            gpui::ImageEffects {
+                radial_fade_end: 1.0,
+                ..Default::default()
+            },
+            gpui::ImageEffects {
+                grain: 0.2,
+                grain_scale: 2.0,
+                ..Default::default()
+            },
+            gpui::ImageEffects {
+                posterize_levels: 3.0,
+                ..Default::default()
+            },
+        ];
+        for effect in effects {
+            let blue = renderer.render_scene_to_image(
+                &image_effect_scene(blue_hidden, effect),
+                device_size(64, 64),
+            )?;
+            let green = renderer.render_scene_to_image(
+                &image_effect_scene(green_hidden, effect),
+                device_size(64, 64),
+            )?;
+            assert_eq!(
+                blue.as_raw(),
+                green.as_raw(),
+                "active effects mixed hidden RGB: {effect:?}"
+            );
+        }
+        // The old plain-image hardware path is deliberately outside this cutover.
+        let blue = renderer.render_scene_to_image(
+            &image_effect_scene(blue_hidden, Default::default()),
+            device_size(64, 64),
+        )?;
+        let green = renderer.render_scene_to_image(
+            &image_effect_scene(green_hidden, Default::default()),
+            device_size(64, 64),
+        )?;
+        assert_ne!(blue.as_raw(), green.as_raw());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_image_effect_bilinear_taps_match_premultiplied_reference() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let bgra = [
+            0, 0, 255, 255, 255, 0, 0, 128, 0, 255, 0, 0, 255, 255, 255, 64,
+        ];
+        let tile = image_tile(&renderer, 813, 2, 2, &bgra)?;
+        // Active, but fully opaque throughout the visible UV domain.
+        let effects = gpui::ImageEffects {
+            radial_fade_start: 2.0,
+            radial_fade_end: 3.0,
+            ..Default::default()
+        };
+        let image = renderer
+            .render_scene_to_image(&image_effect_scene(tile, effects), device_size(64, 64))?;
+        // Cover one-, two- and four-load paths, including every clamped edge.
+        for (x, y) in [
+            (0, 0),
+            (63, 0),
+            (0, 63),
+            (63, 63),
+            (0, 32),
+            (32, 0),
+            (63, 32),
+            (32, 63),
+            (32, 32),
+            (16, 47),
+        ] {
+            let fx = (((x as f32 + 0.5) / 64.0) * 2.0 - 0.5).clamp(0.0, 1.0);
+            let fy = (((y as f32 + 0.5) / 64.0) * 2.0 - 0.5).clamp(0.0, 1.0);
+            let weights = [
+                (1.0 - fx) * (1.0 - fy),
+                fx * (1.0 - fy),
+                (1.0 - fx) * fy,
+                fx * fy,
+            ];
+            let mut expected = [0, 0, 0, 255];
+            for (channel, source_channel) in [2, 1, 0].into_iter().enumerate() {
+                expected[channel] = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(tap, weight)| {
+                        let offset = tap * 4;
+                        weight * bgra[offset + source_channel] as f32 * bgra[offset + 3] as f32
+                            / 255.0
+                    })
+                    .sum::<f32>()
+                    .round() as u8;
+            }
+            assert_pixel(&image, x, y, expected);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_image_effects_clamp_to_visible_crop_not_full_source() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut bgra = [0, 255, 0, 255].repeat(16);
+        for y in 1..3 {
+            for x in 1..3 {
+                let offset = (y * 4 + x) * 4;
+                bgra[offset..offset + 4].copy_from_slice(&[0, 0, 255, 128]);
+            }
+        }
+        let source = image_tile(&renderer, 814, 4, 4, &bgra)?;
+        let mut crop = source;
+        crop.bounds.origin.x.0 += 1;
+        crop.bounds.origin.y.0 += 1;
+        crop.bounds.size = device_size(2, 2);
+        let effects = gpui::ImageEffects {
+            radial_fade_start: 2.0,
+            radial_fade_end: 3.0,
+            ..Default::default()
+        };
+        let mut scene = image_effect_scene(crop, effects);
+        scene.polychrome_sprites[0].source_tile_bounds = source.bounds;
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 64))?;
+        for (x, y) in [
+            (0, 0),
+            (63, 0),
+            (0, 63),
+            (63, 63),
+            (0, 32),
+            (32, 0),
+            (32, 32),
+        ] {
+            assert_pixel(&image, x, y, [128, 0, 0, 255]);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn image_effect_feathers_multiply_source_alpha() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let tile = image_tile(&renderer, 801, 1, 1, &[255, 255, 255, 128])?;
+        let scene = image_effect_scene(
+            tile,
+            gpui::ImageEffects {
+                linear_fade_end: 1.0,
+                radial_fade_end: 1.0,
+                ..Default::default()
+            },
+        );
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 64))?;
+        for (x, y) in [(16, 32), (32, 32), (48, 32), (32, 8)] {
+            let u = (x as f32 + 0.5) / 64.0;
+            let v = (y as f32 + 0.5) / 64.0;
+            let smooth = |t: f32| {
+                let t = t.clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            };
+            let radial = ((u - 0.5).powi(2) + (v - 0.5).powi(2)).sqrt() * 2.0;
+            let expected = (128.0 * (1.0 - smooth(u)) * (1.0 - smooth(radial))).round() as u8;
+            assert_pixel(&image, x, y, [expected, expected, expected, 255]);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn image_effect_wave_is_continuous_and_reflects_source_coordinates() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let pixels: Vec<u8> = (0..8).flat_map(|x| [0, 0, x * 32, 255]).collect();
+        let tile = image_tile(&renderer, 802, 8, 1, &pixels)?;
+        let scene = image_effect_scene(
+            tile,
+            gpui::ImageEffects {
+                wave_amplitude: 96.0,
+                wave_frequency: 1.0,
+                ..Default::default()
+            },
+        );
+        let image = renderer.render_scene_to_image(&scene, device_size(64, 64))?;
+        // Deliberately cross each source edge repeatedly. Every row is checked
+        // against a continuous sine, so a strip-based approximation cannot pass.
+        for y in 0..64 {
+            for x in [0, 20, 32, 63] {
+                let phase = (y as f32 + 0.5) / 64.0 * std::f32::consts::TAU;
+                let source = (x as f32 + 0.5) / 8.0 + 12.0 * phase.sin();
+                let repeated = ((source - 0.5) / 14.0).rem_euclid(1.0);
+                let reflected = 0.5 + (1.0 - (repeated * 2.0 - 1.0).abs()) * 7.0;
+                let red = ((reflected - 0.5) * 32.0).round() as u8;
+                assert_pixel(&image, x, y, [red, 0, 0, 255]);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn image_effect_blur_and_wave_clamp_each_tap_and_ignore_hidden_rgb() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        // Opaque green guard texels represent unrelated atlas content. Hidden
+        // blue in transparent pixels must not contaminate the red foreground.
+        let mut pixels = [0, 255, 0, 255].repeat(10 * 4);
+        for y in 1..3 {
+            for x in 1..9 {
+                let color = if x < 5 {
+                    [0, 0, 255, 255]
+                } else {
+                    [255, 0, 0, 0]
+                };
+                let offset = (y * 10 + x) * 4;
+                pixels[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+        let mut tile = image_tile(&renderer, 803, 10, 4, &pixels)?;
+        tile.bounds.origin.x.0 += 1;
+        tile.bounds.origin.y.0 += 1;
+        tile.bounds.size = device_size(8, 2);
+        for wave_amplitude in [0.0, 128.0] {
+            let scene = image_effect_scene(
+                tile,
+                gpui::ImageEffects {
+                    blur_radius: 16.0,
+                    wave_amplitude,
+                    wave_frequency: 2.0,
+                    ..Default::default()
+                },
+            );
+            let image = renderer.render_scene_to_image(&scene, device_size(64, 64))?;
+            for pixel in image.pixels() {
+                assert_eq!(pixel.0[1], 0, "blur read the neighboring atlas tile");
+                assert_eq!(pixel.0[2], 0, "hidden transparent RGB leaked through blur");
+            }
+            assert!(
+                image
+                    .pixels()
+                    .any(|pixel| pixel.0[0] > 8 && pixel.0[0] < 247)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn image_effect_quantization_and_paper_grain_are_composable_and_stable() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let tile = image_tile(&renderer, 804, 1, 1, &[110, 110, 110, 255])?;
+        let effects = gpui::ImageEffects {
+            posterize_levels: 3.0,
+            ..Default::default()
+        };
+        let flat = image_effect_scene(tile, effects);
+        let image = renderer.render_scene_to_image(&flat, device_size(64, 64))?;
+        assert_pixel(&image, 32, 32, [128, 128, 128, 255]);
+        let paper = image_effect_scene(
+            tile,
+            gpui::ImageEffects {
+                grain: 0.2,
+                grain_scale: 2.0,
+                ..effects
+            },
+        );
+        let first = renderer.render_scene_to_image(&paper, device_size(64, 64))?;
+        let replay = renderer.render_scene_to_image(&paper, device_size(64, 64))?;
+        assert_eq!(first.as_raw(), replay.as_raw());
+        assert!(first.pixels().any(|pixel| pixel.0[0] < 120));
+        assert!(first.pixels().any(|pixel| pixel.0[0] > 136));
+        assert_eq!(first.get_pixel(0, 0), first.get_pixel(1, 1));
         Ok(())
     }
 
@@ -3836,6 +4139,8 @@ mod tests {
             },
             tile,
             transformation,
+            source_tile_bounds: tile.bounds,
+            effects: gpui::ImageEffects::default(),
         });
         scene.finish();
         renderer.render_scene_to_image(&scene, device_size(32, 32))
@@ -3969,6 +4274,8 @@ mod tests {
             corner_radii: Corners::default(),
             tile,
             transformation: gpui::TransformationMatrix::default(),
+            source_tile_bounds: tile.bounds,
+            effects: gpui::ImageEffects::default(),
         };
         let mut no_path_scene = Scene::default();
         no_path_scene.insert_primitive(background);
@@ -4331,6 +4638,8 @@ mod tests {
             },
             tile,
             transformation,
+            source_tile_bounds: tile.bounds,
+            effects: gpui::ImageEffects::default(),
         });
         scene.finish();
         let image = renderer.render_scene_to_image(&scene, device_size(16, 16))?;
@@ -4463,7 +4772,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 30 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 46 * 4);
+        assert_eq!(std::mem::size_of::<gpui::ImageEffects>(), 12 * 4);
+        assert_eq!(
+            std::mem::offset_of!(PolychromeSprite, source_tile_bounds),
+            30 * 4
+        );
+        assert_eq!(std::mem::offset_of!(PolychromeSprite, effects), 34 * 4);
     }
 
     #[test]

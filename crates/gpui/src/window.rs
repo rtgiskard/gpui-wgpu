@@ -8428,6 +8428,24 @@ mod tests {
     }
 
     #[test]
+    fn positive_image_crops_keep_at_least_one_texel_inside_the_source_tile() {
+        for origin in [0, 13, 1024] {
+            for length in [1, 2, 17] {
+                for offset in [0.0, 0.25, 0.9999] {
+                    for visible in [0.00001, 0.01, 0.25] {
+                        let (start, extent) =
+                            Window::image_crop_axis(origin, length, offset, visible);
+                        assert!(start >= origin && start < origin + length);
+                        assert!(extent >= 1 && start + extent <= origin + length);
+                    }
+                }
+            }
+        }
+        assert_eq!(Window::image_crop_axis(13, 16, 0.25, 0.5), (17, 8));
+        assert_eq!(Window::image_crop_axis(13, 1, 0.9999, 0.00001), (13, 1));
+    }
+
+    #[test]
     fn tooltips_avoid_the_cursor_and_stay_inside_viewport_edges() {
         let viewport = size(px(800.), px(600.));
         let tooltip = size(px(200.), px(80.));
