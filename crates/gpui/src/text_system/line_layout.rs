@@ -848,6 +848,10 @@ mod tests {
         assert_eq!(wrapped.len(), "cold wrapped miss".len());
         cache.finish_frame();
         cache.reuse_layouts(start.clone()..end.clone());
+        // Carry a frame using only replay: no layout lookup may rescue an entry
+        // left behind in the discarded cache.
+        cache.finish_frame();
+        cache.reuse_layouts(start.clone()..end.clone());
         let replayed = cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
         assert!(Arc::ptr_eq(&wrapped, &replayed));
         cache.truncate_layouts(start.clone());
