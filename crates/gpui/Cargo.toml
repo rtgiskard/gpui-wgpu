@@ -1,4 +1,4 @@
-# Pinned Zed df48a139ce9c292738b523252c12f044697e673f; workspace dependencies resolved without upgrades.
+# Pinned Zed df48a139ce9c292738b523252c12f044697e673f with selected downstream fixes.
 
 ["package"]
 "name" = "gpui"

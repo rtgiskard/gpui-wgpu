@@ -1,4 +1,4 @@
-# Pinned Zed df48a139ce9c292738b523252c12f044697e673f; workspace dependencies resolved without upgrades.
+# Pinned Zed df48a139ce9c292738b523252c12f044697e673f with selected downstream fixes.
 
 ["package"]
 "name" = "gpui_wgpu"
@@ -99,16 +99,19 @@
 ["target"."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))"."dependencies"]
 
 ["target"."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))"."dependencies"."wgpu"]
-"version" = "29.0"
+# Retains the Vulkan surface-drop fix (wgpu#10230) and WebGL resize fix (wgpu#10348).
+"git" = "https://github.com/gfx-rs/wgpu"
+"rev" = "cddb2f5d80dc0009b2ef6767635140cacf90a007"
 "default-features" = false
-"features" = ["std", "parking_lot", "metal", "gles", "vulkan", "wgsl", "webgpu"]
+"features" = ["std", "metal", "gles", "vulkan", "wgsl", "webgpu"]
 
 ["target"."cfg(not(any(target_os = \"linux\", target_os = \"freebsd\")))"]
 
 ["target"."cfg(not(any(target_os = \"linux\", target_os = \"freebsd\")))"."dependencies"]
 
 ["target"."cfg(not(any(target_os = \"linux\", target_os = \"freebsd\")))"."dependencies"."wgpu"]
-"version" = "29.0"
+"git" = "https://github.com/gfx-rs/wgpu"
+"rev" = "cddb2f5d80dc0009b2ef6767635140cacf90a007"
 "default-features" = true
 
 ["target"."cfg(target_family = \"wasm\")"]
@@ -120,7 +123,8 @@
 "features" = ["HtmlCanvasElement"]
 
 ["target"."cfg(target_family = \"wasm\")"."dependencies"."wgpu"]
-"version" = "29.0"
+"git" = "https://github.com/gfx-rs/wgpu"
+"rev" = "cddb2f5d80dc0009b2ef6767635140cacf90a007"
 "default-features" = false
 "features" = ["webgl"]
 
@@ -142,7 +146,9 @@
 "features" = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "rayon", "tga", "tiff", "webp"]
 
 ["dev-dependencies"."naga"]
-"version" = "29.0.4"
+# Validate shaders with the same Naga revision used by wgpu at runtime.
+"git" = "https://github.com/gfx-rs/wgpu"
+"rev" = "cddb2f5d80dc0009b2ef6767635140cacf90a007"
 "features" = ["wgsl-in"]
 
 # Standalone regression-test root; the application supplies its own patches.

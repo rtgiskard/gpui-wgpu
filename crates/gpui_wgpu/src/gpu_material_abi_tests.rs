@@ -11,7 +11,7 @@ fn mapped_creation_keeps_unwritten_abi_bytes_zero_without_a_second_fill() -> any
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "material initialization regression",
         |bytes| put_u32(bytes, 4, 0x1234_5678),
-    );
+    )?;
     let submission = context.queue.submit(std::iter::empty());
     let (sender, receiver) = std::sync::mpsc::channel();
     buffer
@@ -25,7 +25,7 @@ fn mapped_creation_keeps_unwritten_abi_bytes_zero_without_a_second_fill() -> any
     })?;
     receiver.recv_timeout(std::time::Duration::from_secs(30))??;
     {
-        let mapped = buffer.slice(..).get_mapped_range();
+        let mapped = buffer.slice(..).get_mapped_range()?;
         let mut expected = [0_u8; PLACEMENT_SIZE as usize];
         expected[4..8].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
         assert_eq!(&mapped[..], &expected);

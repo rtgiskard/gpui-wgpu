@@ -445,7 +445,7 @@ impl MaterialRenderer {
             byte_limit: MAX_BYTES,
             allocation_limit: MAX_ALLOCATIONS,
             premultiplied: alpha == wgpu::CompositeAlphaMode::PreMultiplied,
-            srgb_target: format.is_srgb(),
+            srgb_target: format.has_srgb_suffix(),
             target_format: format,
             path_samples,
             program_attempted: false,
@@ -703,6 +703,9 @@ impl MaterialRenderer {
                 .get_mut(&upload.palette_id)
                 .unwrap()
                 .last_submission = serial;
+            // Reused uploads also advance their retirement serial. Even if the
+            // placement mapping below fails, that serial needs a queue callback.
+            self.preparing = true;
             prepared.draws.insert(
                 index,
                 PreparedDraw {
@@ -749,6 +752,14 @@ impl MaterialRenderer {
                     }
                 },
             );
+            let buffer = match buffer {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    skipped[2] += prepared.draws.len();
+                    self.report_skipped(skipped, Some(&error));
+                    return PreparedMaterials::default();
+                }
+            };
             prepared.placement = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("GPU frame placements"),
                 layout: &self.program.as_ref().unwrap().placement_layout,
@@ -833,7 +844,7 @@ impl MaterialRenderer {
                         put_floats(bytes, index * PALETTE_STRIDE as usize, color);
                     }
                 },
-            );
+            )?;
             let charge = palette_size * INITIALIZATION_COPIES;
             self.palettes.insert(
                 palette_id,
@@ -845,6 +856,8 @@ impl MaterialRenderer {
                 },
             );
             self.bytes += charge;
+            // A later data mapping failure must still retire this initialized palette.
+            self.preparing = true;
             #[cfg(test)]
             {
                 self.palette_upload_count += 1;
@@ -856,7 +869,7 @@ impl MaterialRenderer {
             wgpu::BufferUsages::STORAGE,
             "immutable GPU material data",
             |bytes| encode_frame(bytes, frame),
-        );
+        )?;
         let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("immutable GPU material"),
             layout: &self.program.as_ref().unwrap().data_layout,
@@ -966,7 +979,7 @@ fn mapped_buffer(
     usage: wgpu::BufferUsages,
     label: &str,
     encode: impl FnOnce(&mut wgpu::WriteOnly<'_, [u8]>),
-) -> wgpu::Buffer {
+) -> anyhow::Result<wgpu::Buffer> {
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
@@ -974,15 +987,21 @@ fn mapped_buffer(
         mapped_at_creation: true,
     });
     {
-        let mut mapped = buffer.slice(..).get_mapped_range_mut();
+        let mut mapped = match buffer.slice(..).get_mapped_range_mut() {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                buffer.unmap();
+                return Err(error.into());
+            }
+        };
         let mut bytes = mapped.slice(..);
-        // wgpu 29 guarantees every new Buffer starts zeroed, including its
+        // wgpu guarantees every new Buffer starts zeroed, including its
         // mapped-at-creation view. Preserve untouched ABI padding without a
         // second full upload-sized CPU zero pass.
         encode(&mut bytes);
     }
     buffer.unmap();
-    buffer
+    Ok(buffer)
 }
 fn put_u32(bytes: &mut wgpu::WriteOnly<'_, [u8]>, offset: usize, value: u32) {
     bytes
