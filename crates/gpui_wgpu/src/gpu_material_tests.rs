@@ -1183,6 +1183,45 @@ fn gpu_rectangles_premultiplied_and_srgb_target_conventions() -> anyhow::Result<
     Ok(())
 }
 
+#[test]
+fn native_translucent_path_composites_source_over_transparent_background() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new_for_msaa_comparison(true)?;
+    let mut scene = Scene::default();
+    scene.insert_primitive(quad(
+        bounds(0.0, 0.0, 16.0, 16.0),
+        gpui::Hsla {
+            a: 0.5,
+            ..gpui::blue()
+        },
+    ));
+    let point = |x, y| gpui::point(gpui::px(x), gpui::px(y));
+    let mut builder = gpui::PathBuilder::fill();
+    builder.move_to(point(4.0, 4.0));
+    builder.line_to(point(12.0, 4.0));
+    builder.line_to(point(12.0, 12.0));
+    builder.line_to(point(4.0, 12.0));
+    builder.close();
+    let mut path = builder.build()?.scale(1.0);
+    path.color = gpui::Hsla {
+        a: 0.5,
+        ..gpui::red()
+    }
+    .into();
+    path.content_mask = ContentMask {
+        bounds: path.bounds,
+    };
+    scene.insert_primitive(path);
+    scene.finish();
+
+    let image = renderer.render_scene_to_image(&scene, size(20, 20))?;
+    pixel(&image, 18, 18, [0, 0, 0, 0]);
+    pixel(&image, 2, 2, [0, 0, 128, 128]);
+    // Premultiplied source-over: C = red * .5 + blue * .5 * (1 - .5),
+    // A = .5 + .5 * (1 - .5). Additive destination alpha incorrectly yields 255.
+    pixel(&image, 8, 8, [128, 0, 64, 191]);
+    Ok(())
+}
+
 fn field_frame(
     width: u32,
     height: u32,
