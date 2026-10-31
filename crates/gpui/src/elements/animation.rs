@@ -722,7 +722,6 @@ mod tests {
         assert!((delta - 0.25).abs() < 1e-2);
     }
 
-
     // Before parent-animation-element, using .with_animation
     // would not allow chaining .parent after. This is just a
     // build check that we can call div().id().with_animation().child()

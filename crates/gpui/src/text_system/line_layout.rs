@@ -578,12 +578,7 @@ impl LineLayoutCache {
                     }
                 )+ };
             }
-            trim!(
-                lines,
-                wrapped_lines,
-                used_lines,
-                used_wrapped_lines
-            );
+            trim!(lines, wrapped_lines, used_lines, used_wrapped_lines);
         }
     }
 
@@ -605,6 +600,7 @@ impl LineLayoutCache {
             font_size,
             runs,
             wrap_width,
+            max_lines,
             force_width: None,
         } as &dyn AsCacheKeyRef;
 
@@ -613,7 +609,11 @@ impl LineLayoutCache {
             return layout.clone();
         }
 
-        let previous_frame_entry = self.previous_frame.borrow_mut().wrapped_lines.remove_entry(key);
+        let previous_frame_entry = self
+            .previous_frame
+            .borrow_mut()
+            .wrapped_lines
+            .remove_entry(key);
         drop(current_frame);
         if let Some((key, layout)) = previous_frame_entry {
             let mut current_frame = self.current_frame.borrow_mut();
@@ -640,6 +640,7 @@ impl LineLayoutCache {
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width,
+                max_lines,
                 force_width: None,
             });
 
@@ -670,6 +671,7 @@ impl LineLayoutCache {
             font_size,
             runs,
             wrap_width: None,
+            max_lines: None,
             force_width,
         } as &dyn AsCacheKeyRef;
 
@@ -700,6 +702,7 @@ impl LineLayoutCache {
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
+                max_lines: None,
                 force_width,
             });
             let layout = Arc::new(layout);
@@ -771,6 +774,7 @@ struct CacheKey {
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
+    max_lines: Option<usize>,
     force_width: Option<Pixels>,
 }
 
@@ -780,6 +784,7 @@ struct CacheKeyRef<'a> {
     font_size: Pixels,
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
+    max_lines: Option<usize>,
     force_width: Option<Pixels>,
 }
 
@@ -804,6 +809,7 @@ impl AsCacheKeyRef for CacheKey {
             font_size: self.font_size,
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
+            max_lines: self.max_lines,
             force_width: self.force_width,
         }
     }
@@ -843,7 +849,8 @@ mod tests {
         let generation = Arc::new(AtomicUsize::new(0));
         let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem), generation.clone());
         let start = cache.layout_index();
-        let wrapped = cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
+        let wrapped =
+            cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
         let end = cache.layout_index();
         assert_eq!(wrapped.len(), "cold wrapped miss".len());
         cache.finish_frame();
@@ -852,22 +859,153 @@ mod tests {
         // left behind in the discarded cache.
         cache.finish_frame();
         cache.reuse_layouts(start.clone()..end.clone());
-        let replayed = cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
+        let replayed =
+            cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
         assert!(Arc::ptr_eq(&wrapped, &replayed));
         cache.truncate_layouts(start.clone());
-        assert_eq!(cache.layout_index().wrapped_lines_index, start.wrapped_lines_index);
+        assert_eq!(
+            cache.layout_index().wrapped_lines_index,
+            start.wrapped_lines_index
+        );
         generation.fetch_add(1, Ordering::Release);
         cache.reuse_layouts(start.clone()..end);
         cache.truncate_layouts(start);
-        let fresh = cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
+        let fresh =
+            cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
         assert!(!Arc::ptr_eq(&wrapped, &fresh));
-        assert!(!Arc::ptr_eq(&wrapped.unwrapped_layout, &fresh.unwrapped_layout));
+        assert!(!Arc::ptr_eq(
+            &wrapped.unwrapped_layout,
+            &fresh.unwrapped_layout
+        ));
         cache.finish_frame();
         cache.finish_frame();
         assert!(cache.previous_frame.borrow().lines.is_empty());
         assert!(cache.previous_frame.borrow().wrapped_lines.is_empty());
         assert!(cache.current_frame.borrow().used_lines.is_empty());
         assert!(cache.current_frame.borrow().used_wrapped_lines.is_empty());
+    }
+
+    #[test]
+    fn wrapped_layout_cache_distinguishes_line_limits_in_both_orders_and_frames() {
+        for cross_frame in [false, true] {
+            for limits in [[Some(1), None], [None, Some(1)]] {
+                let cache = LineLayoutCache::new(
+                    Arc::new(crate::NoopTextSystem),
+                    Arc::new(AtomicUsize::new(0)),
+                );
+                let layout = |max_lines| {
+                    cache.layout_wrapped_line(
+                        "abcdefghijkl",
+                        px(10.),
+                        &[],
+                        Some(px(24.)),
+                        max_lines,
+                    )
+                };
+                let first = layout(limits[0]);
+                if cross_frame {
+                    cache.finish_frame();
+                }
+                let second = layout(limits[1]);
+                for (wrapped, limit) in [(&first, limits[0]), (&second, limits[1])] {
+                    let rows = limit.unwrap_or(3);
+                    assert_eq!(wrapped.wrap_boundaries().len(), rows - 1);
+                    assert_eq!(wrapped.size(px(16.)).height, px(16.) * rows);
+                    assert_eq!(wrapped.width(), px(24.));
+                }
+
+                for _ in 0..2 {
+                    for (limit, rows) in [(Some(1), 1), (Some(2), 2), (None, 3)] {
+                        let wrapped = layout(limit);
+                        assert_eq!(wrapped.wrap_boundaries().len(), rows - 1);
+                        assert_eq!(wrapped.size(px(16.)).height, px(16.) * rows);
+                        assert_eq!(wrapped.width(), px(24.));
+                        assert_eq!(wrapped.len(), 12);
+                        if rows > 1 {
+                            assert_eq!(
+                                wrapped.index_for_position(point(px(0.), px(16.)), px(16.)),
+                                Ok(4),
+                            );
+                        }
+                    }
+                    cache.finish_frame();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_unicode_layout_reuses_shaping_and_byte_boundaries() {
+        let cache = LineLayoutCache::new(
+            Arc::new(crate::NoopTextSystem),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let text = "a😀é中";
+        let start = cache.layout_index();
+        let wrapped = cache.layout_wrapped_line(text, px(10.), &[], Some(px(12.)), None);
+        let clamped = cache.layout_wrapped_line(text, px(10.), &[], Some(px(12.)), Some(1));
+        let end = cache.layout_index();
+        assert!(Arc::ptr_eq(
+            &wrapped.unwrapped_layout,
+            &clamped.unwrapped_layout
+        ));
+        assert!(clamped.wrap_boundaries().is_empty());
+        assert!(!wrapped.wrap_boundaries().is_empty());
+        assert_eq!(wrapped.len(), text.len());
+        assert_eq!(
+            wrapped.runs()[0]
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 5, 7],
+        );
+        for (row, boundary) in wrapped.wrap_boundaries().iter().enumerate() {
+            let byte_index = wrapped.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+            assert!(text.is_char_boundary(byte_index));
+            assert_eq!(
+                wrapped.index_for_position(point(px(0.), px(16.) * (row + 1)), px(16.)),
+                Ok(byte_index),
+            );
+        }
+        let rows = wrapped.wrap_boundaries().len() + 1;
+        assert_eq!(
+            wrapped.index_for_position(point(px(0.), px(16.) * rows), px(16.)),
+            Err(0),
+        );
+        for _ in 0..2 {
+            cache.finish_frame();
+            cache.reuse_layouts(start.clone()..end.clone());
+        }
+        let replayed = cache.layout_wrapped_line(text, px(10.), &[], Some(px(12.)), None);
+        assert!(Arc::ptr_eq(&wrapped, &replayed));
+        let replayed_clamped =
+            cache.layout_wrapped_line(text, px(10.), &[], Some(px(12.)), Some(1));
+        assert!(Arc::ptr_eq(&clamped, &replayed_clamped));
+    }
+
+    #[test]
+    fn wrapped_hit_test_handles_boundary_past_shaped_width() {
+        let wrapped = WrappedLineLayout {
+            unwrapped_layout: Arc::new(LineLayout {
+                width: px(10.),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs: vec![glyph_at(0., 0), glyph_at(11., 2)],
+                }],
+                len: "é\u{200b}".len(),
+                ..LineLayout::default()
+            }),
+            wrap_boundaries: SmallVec::from_slice(&[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 1,
+            }]),
+            wrap_width: Some(px(11.)),
+        };
+        assert_eq!(
+            wrapped.index_for_position(point(px(10.5), px(0.)), px(16.)),
+            Err(2),
+        );
     }
 
     #[test]

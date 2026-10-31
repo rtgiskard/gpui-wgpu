@@ -280,42 +280,43 @@ impl Element for UniformList {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let max_items = self.item_count;
-        let item_size = self.measure_item(None, window, cx);
+        let item_size = match self.sizing_behavior {
+            ListSizingBehavior::Infer => Some(self.measure_item(None, window, cx)),
+            ListSizingBehavior::Auto => None,
+        };
         let layout_id = self.interactivity.request_layout(
             global_id,
             inspector_id,
             window,
             cx,
-            |style, window, cx| match self.sizing_behavior {
-                ListSizingBehavior::Infer => {
-                    window.with_text_style(style.text_style().cloned(), |window| {
-                        window.request_measured_layout(
-                            style,
-                            move |known_dimensions, available_space, _window, _cx| {
-                                let desired_height = item_size.height * max_items;
-                                let width = known_dimensions.width.unwrap_or(match available_space
+            |style, window, cx| match item_size {
+                Some(item_size) => window.with_text_style(style.text_style().cloned(), |window| {
+                    window.request_measured_layout(
+                        style,
+                        move |known_dimensions, available_space, _window, _cx| {
+                            let desired_height = item_size.height * max_items;
+                            let width =
+                                known_dimensions
                                     .width
-                                {
-                                    AvailableSpace::Definite(x) => x,
-                                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                                        item_size.width
-                                    }
-                                });
-                                let height = match available_space.height {
-                                    AvailableSpace::Definite(height) => desired_height.min(height),
-                                    AvailableSpace::MinContent | AvailableSpace::MaxContent => {
-                                        desired_height
-                                    }
-                                };
-                                size(width, height)
-                            },
-                        )
-                    })
-                }
-                ListSizingBehavior::Auto => window
-                    .with_text_style(style.text_style().cloned(), |window| {
-                        window.request_layout(style, None, cx)
-                    }),
+                                    .unwrap_or(match available_space.width {
+                                        AvailableSpace::Definite(x) => x,
+                                        AvailableSpace::MinContent | AvailableSpace::MaxContent => {
+                                            item_size.width
+                                        }
+                                    });
+                            let height = match available_space.height {
+                                AvailableSpace::Definite(height) => desired_height.min(height),
+                                AvailableSpace::MinContent | AvailableSpace::MaxContent => {
+                                    desired_height
+                                }
+                            };
+                            size(width, height)
+                        },
+                    )
+                }),
+                None => window.with_text_style(style.text_style().cloned(), |window| {
+                    window.request_layout(style, None, cx)
+                }),
             },
         );
 

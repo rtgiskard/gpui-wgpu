@@ -1,9 +1,9 @@
 #[cfg(target_os = "linux")]
 use crate::fontconfig::{FontconfigCandidate, FontconfigResolver, FontconfigStyle};
 use anyhow::{Context as _, Ok, Result};
+use collections::HashMap;
 #[cfg(target_os = "linux")]
 use collections::HashSet;
-use collections::HashMap;
 use cosmic_text::{
     Attrs, AttrsList, Ellipsize, Family, Font as CosmicTextFont,
     FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine, Stretch, Style, Weight,
@@ -1824,7 +1824,12 @@ mod tests {
         state.append_system_fallbacks(
             primary,
             &request,
-            &[regular.clone(), mapping_failure, loading_failure, bold.clone()],
+            &[
+                regular.clone(),
+                mapping_failure,
+                loading_failure,
+                bold.clone(),
+            ],
             &mut remaining,
             &mut properties,
         );
@@ -1832,8 +1837,14 @@ mod tests {
         assert_eq!(properties.fallback_chain.len(), 2);
         let regular_id = state.fontconfig_face_id(&regular)?.unwrap();
         let bold_id = state.fontconfig_face_id(&bold)?.unwrap();
-        assert_eq!(state.loaded_font(properties.fallback_chain[0].0).font.id(), regular_id);
-        assert_eq!(state.loaded_font(properties.fallback_chain[1].0).font.id(), bold_id);
+        assert_eq!(
+            state.loaded_font(properties.fallback_chain[0].0).font.id(),
+            regular_id
+        );
+        assert_eq!(
+            state.loaded_font(properties.fallback_chain[1].0).font.id(),
+            bold_id
+        );
 
         // A covered requirement stops before loading later ordered candidates.
         let mut properties = state.font_match_properties(primary).unwrap();
@@ -1847,7 +1858,10 @@ mod tests {
         );
         assert!(remaining.is_empty());
         assert_eq!(properties.fallback_chain.len(), 1);
-        assert_eq!(state.loaded_font(properties.fallback_chain[0].0).font.id(), regular_id);
+        assert_eq!(
+            state.loaded_font(properties.fallback_chain[0].0).font.id(),
+            regular_id
+        );
         Ok(())
     }
 
@@ -1949,12 +1963,17 @@ mod tests {
         backend.0.write().fontconfig = Some(Err("isolated configuration failure".into()));
         let text_system = gpui::TextSystem::new(backend.clone());
         for _ in 0..2 {
-            let error = text_system.resolve_system_font_family("monospace").unwrap_err();
+            let error = text_system
+                .resolve_system_font_family("monospace")
+                .unwrap_err();
             assert_eq!(error.to_string(), "isolated configuration failure");
         }
 
         let request = Font {
-            fallbacks: Some(FontFallbacks::from_system_family("monospace", "IBM Plex Sans")),
+            fallbacks: Some(FontFallbacks::from_system_family(
+                "monospace",
+                "IBM Plex Sans",
+            )),
             ..gpui::font("IBM Plex Sans")
         };
         let primary = backend.font_id(&request)?;

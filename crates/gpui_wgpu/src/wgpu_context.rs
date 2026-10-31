@@ -146,14 +146,20 @@ fn select_native_backend<T>(
                 Err(error) => {
                     log::info!(
                         "No usable {backend:?} {} adapter: {error:#}",
-                        if software_only { "software" } else { "hardware" },
+                        if software_only {
+                            "software"
+                        } else {
+                            "hardware"
+                        },
                     );
                     last_error = Some(error);
                 }
             }
         }
     }
-    Err(last_error.unwrap().context("No usable native GPU backend found"))
+    Err(last_error
+        .unwrap()
+        .context("No usable native GPU backend found"))
 }
 
 impl WgpuContext {
@@ -856,6 +862,105 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 mod tests {
     use super::{DeviceErrorState, parse_pci_id};
 
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn atlas_recovery_adopts_smaller_device_limits() -> anyhow::Result<()> {
+        use super::WgpuContext;
+        use crate::WgpuAtlas;
+        use gpui::{AtlasKey, DevicePixels, ImageId, PlatformAtlas, RenderImageParams, Size};
+        use std::borrow::Cow;
+
+        // Do not replace or destroy the process-shared headless device. Both
+        // private devices use one adapter, but deliberately expose small limits.
+        let (shared, _) = WgpuContext::new_headless()?;
+        let request = |limit| {
+            gpui::block_on(shared.adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("atlas recovery limit regression"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits {
+                    max_texture_dimension_2d: limit,
+                    ..wgpu::Limits::downlevel_defaults().using_alignment(shared.adapter.limits())
+                },
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                ..Default::default()
+            }))
+        };
+        let context = |device, queue| {
+            WgpuContext::from_native_adapter_and_device(
+                shared.instance.clone(),
+                shared.adapter.clone(),
+                device,
+                queue,
+                false,
+                wgpu::TextureFormat::Rgba8Unorm,
+            )
+        };
+        let (device, queue) = request(128)?;
+        let original = context(device, queue);
+        let (device, queue) = request(64)?;
+        let recovered = context(device, queue);
+        let atlas = WgpuAtlas::from_context(&original);
+        let key = |id| {
+            AtlasKey::Image(RenderImageParams {
+                image_id: ImageId(id),
+                frame_index: 0,
+            })
+        };
+        let dimensions = |width| Size {
+            width: DevicePixels(width),
+            height: DevicePixels(8),
+        };
+        let old_key = key(700);
+        let old_tile = atlas
+            .get_or_insert_with(old_key.clone(), &mut || {
+                Ok(Some((dimensions(96), Cow::Owned(vec![255; 96 * 8 * 4]))))
+            })?
+            .unwrap();
+        atlas.before_frame();
+        let old_generation = atlas
+            .get_texture_info(old_tile.texture_id)
+            .unwrap()
+            .generation;
+
+        atlas.handle_device_lost(&recovered);
+        assert!(!atlas.contains(&old_key));
+        assert!(atlas.get_texture_info(old_tile.texture_id).is_none());
+        let validation = recovered
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        // This was valid on the previous device and must now be an API error,
+        // not an invalid GPU texture creation.
+        assert!(
+            atlas
+                .get_or_insert_with(key(701), &mut || {
+                    Ok(Some((dimensions(96), Cow::Owned(vec![255; 96 * 8 * 4]))))
+                })
+                .is_err()
+        );
+        let mut rebuilt = false;
+        let tile = atlas
+            .get_or_insert_with(old_key.clone(), &mut || {
+                rebuilt = true;
+                Ok(Some((dimensions(16), Cow::Owned(vec![127; 16 * 8 * 4]))))
+            })?
+            .unwrap();
+        assert!(rebuilt, "recovery must rebuild the old cached key");
+        atlas.before_frame();
+        let texture = atlas.get_texture_info(tile.texture_id).unwrap();
+        assert_ne!(texture.generation, old_generation);
+        let cached = atlas
+            .get_or_insert_with(old_key, &mut || {
+                anyhow::bail!("a recovered legal tile must remain reusable")
+            })?
+            .unwrap();
+        assert_eq!(cached.texture_id, tile.texture_id);
+        assert_eq!(cached.bounds, tile.bounds);
+        assert!(gpui::block_on(validation.pop()).is_none());
+        Ok(())
+    }
+
     #[test]
     fn native_vulkan_success_never_initializes_gl() {
         let mut attempts = Vec::new();
@@ -889,10 +994,11 @@ mod tests {
     #[test]
     fn native_backend_failures_preserve_bounded_software_fallback() {
         let mut attempts = Vec::new();
-        let result: anyhow::Result<()> = super::select_native_backend(false, |backend, software| {
-            attempts.push((backend, software));
-            anyhow::bail!("surface creation, device creation, or configuration failed")
-        });
+        let result: anyhow::Result<()> =
+            super::select_native_backend(false, |backend, software| {
+                attempts.push((backend, software));
+                anyhow::bail!("surface creation, device creation, or configuration failed")
+            });
         assert!(result.is_err());
         assert_eq!(
             attempts,

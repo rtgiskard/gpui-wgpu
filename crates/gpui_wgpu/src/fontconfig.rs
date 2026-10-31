@@ -116,7 +116,8 @@ impl FontconfigResolver {
             text,
         };
         let config = &mut self.config;
-        self.cache.resolve(query, |needed| config.resolve(query, needed))
+        self.cache
+            .resolve(query, |needed| config.resolve(query, needed))
     }
 }
 
@@ -163,8 +164,12 @@ impl Config {
             fc::FcDefaultSubstitute(pattern.0.as_ptr());
             let mut result = fc::FcResultNoMatch;
             let matched = Pattern(
-                NonNull::new(fc::FcFontMatch(self.0.as_ptr(), pattern.0.as_ptr(), &mut result))
-                    .ok_or(FontconfigError::Operation("FcFontMatch"))?,
+                NonNull::new(fc::FcFontMatch(
+                    self.0.as_ptr(),
+                    pattern.0.as_ptr(),
+                    &mut result,
+                ))
+                .ok_or(FontconfigError::Operation("FcFontMatch"))?,
             );
             check_result(result, "FcFontMatch")?;
             matched.available_family(available)
@@ -321,7 +326,10 @@ impl Pattern {
             }
             // SAFETY: successful FcPatternGetString returns a terminated string.
             let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-            if let Some(canonical) = available.iter().find(|candidate| candidate.as_str() == name) {
+            if let Some(canonical) = available
+                .iter()
+                .find(|candidate| candidate.as_str() == name)
+            {
                 return Ok(canonical.clone());
             }
         }
@@ -544,14 +552,18 @@ impl CandidateCache {
         needed: &mut NeededCharacters,
         load: impl FnOnce(&mut NeededCharacters) -> Result<Candidates>,
     ) -> Result<Candidates> {
-        if let Some(entry) = self.entries.iter().find(|entry| entry.matches(query, &needed.0)) {
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.matches(query, &needed.0))
+        {
             return Ok(entry.candidates.clone());
         }
         let key_bytes = query.key_bytes(&needed.0);
         // Resolution consumes coverage from needed; preserve only cacheable
         // keys beforehand, reusing the normalized buffer for the FFI work.
-        let characters = (key_bytes <= MAX_CACHE_KEY_BYTES)
-            .then(|| needed.0.clone().into_boxed_slice());
+        let characters =
+            (key_bytes <= MAX_CACHE_KEY_BYTES).then(|| needed.0.clone().into_boxed_slice());
         let candidates = load(needed)?;
         let Some(characters) = characters else {
             return Ok(candidates);
@@ -683,14 +695,20 @@ mod tests {
         assert!(cache.entries.is_empty());
         cache.resolve(query("a"), empty).unwrap();
         cache
-            .resolve(query("aaa"), |_| panic!("negative result should be memoized"))
+            .resolve(query("aaa"), |_| {
+                panic!("negative result should be memoized")
+            })
             .unwrap();
         assert_eq!(cache.entries.len(), 1);
-        cache.resolve(query(""), |needed| {
-            assert!(needed.0.is_empty());
-            empty(needed)
-        }).unwrap();
-        cache.resolve(query(""), |_| panic!("empty scalar set should be memoized")).unwrap();
+        cache
+            .resolve(query(""), |needed| {
+                assert!(needed.0.is_empty());
+                empty(needed)
+            })
+            .unwrap();
+        cache
+            .resolve(query(""), |_| panic!("empty scalar set should be memoized"))
+            .unwrap();
     }
 
     #[test]
@@ -710,7 +728,9 @@ mod tests {
             })
             .unwrap();
         let returned = cache
-            .resolve(query("\u{301}aa日日"), |_| panic!("same scalar set must hit"))
+            .resolve(query("\u{301}aa日日"), |_| {
+                panic!("same scalar set must hit")
+            })
             .unwrap();
         assert!(Arc::ptr_eq(&returned, &candidates));
         for text in ["a日", "a\u{301}本", "á日"] {
@@ -730,9 +750,14 @@ mod tests {
             })
             .unwrap();
         cache
-            .resolve(query("日aa"), |_| panic!("compressed key should be memoized"))
+            .resolve(query("日aa"), |_| {
+                panic!("compressed key should be memoized")
+            })
             .unwrap();
-        assert_eq!(cache.key_bytes, query("").key_bytes(&[u32::from('a'), u32::from('日')]));
+        assert_eq!(
+            cache.key_bytes,
+            query("").key_bytes(&[u32::from('a'), u32::from('日')])
+        );
     }
 
     #[test]
@@ -764,17 +789,21 @@ mod tests {
             Query { text: "b", ..base },
         ];
         for (index, request) in requests.into_iter().enumerate() {
-            let result = cache.resolve(request, |_| {
-                Ok(vec![FontconfigCandidate {
-                    file: PathBuf::new(),
-                    index: index as u32,
-                }]
-                .into())
-            }).unwrap();
+            let result = cache
+                .resolve(request, |_| {
+                    Ok(vec![FontconfigCandidate {
+                        file: PathBuf::new(),
+                        index: index as u32,
+                    }]
+                    .into())
+                })
+                .unwrap();
             assert_eq!(result[0].index, index as u32);
         }
         for (index, request) in requests.into_iter().enumerate().rev() {
-            let result = cache.resolve(request, |_| panic!("expected isolated cache hit")).unwrap();
+            let result = cache
+                .resolve(request, |_| panic!("expected isolated cache hit"))
+                .unwrap();
             assert_eq!(result[0].index, index as u32);
         }
     }
@@ -783,10 +812,17 @@ mod tests {
     fn cache_bounds_entry_count_and_aggregate_key_bytes() {
         let mut cache = CandidateCache::default();
         for index in 0..MAX_CACHE_ENTRIES + 1 {
-            cache.resolve(query(&unique_text(0x1000 + index as u32, 1)), empty).unwrap();
+            cache
+                .resolve(query(&unique_text(0x1000 + index as u32, 1)), empty)
+                .unwrap();
         }
         assert_eq!(cache.entries.len(), MAX_CACHE_ENTRIES);
-        assert!(!cache.entries.iter().any(|entry| &*entry.characters == [0x1000]));
+        assert!(
+            !cache
+                .entries
+                .iter()
+                .any(|entry| &*entry.characters == [0x1000])
+        );
 
         let text = unique_text(0x10000, MAX_CACHE_KEY_BYTES / 8);
         cache.resolve(query(&text), empty).unwrap();
@@ -796,7 +832,11 @@ mod tests {
         assert!(cache.key_bytes <= MAX_CACHE_KEY_BYTES);
         assert_eq!(
             cache.key_bytes,
-            cache.entries.iter().map(CacheEntry::key_bytes).sum::<usize>()
+            cache
+                .entries
+                .iter()
+                .map(CacheEntry::key_bytes)
+                .sum::<usize>()
         );
     }
 
@@ -806,14 +846,17 @@ mod tests {
         let count = MAX_CACHE_KEY_BYTES / std::mem::size_of::<u32>() + 1;
         let text = unique_text(0x10000, count);
         for _ in 0..2 {
-            let returned = cache.resolve(query(&text), |needed| {
-                assert_eq!(needed.0.len(), count);
-                assert_eq!(needed.0.last(), Some(&(0x10000 + count as u32 - 1)));
-                Ok(vec![FontconfigCandidate {
-                    file: PathBuf::new(),
-                    index: needed.0.len() as u32,
-                }].into())
-            }).unwrap();
+            let returned = cache
+                .resolve(query(&text), |needed| {
+                    assert_eq!(needed.0.len(), count);
+                    assert_eq!(needed.0.last(), Some(&(0x10000 + count as u32 - 1)));
+                    Ok(vec![FontconfigCandidate {
+                        file: PathBuf::new(),
+                        index: needed.0.len() as u32,
+                    }]
+                    .into())
+                })
+                .unwrap();
             assert_eq!(returned[0].index, count as u32);
             assert!(cache.entries.is_empty());
             assert_eq!(cache.key_bytes, 0);
@@ -824,14 +867,23 @@ mod tests {
     fn cache_hits_do_not_refresh_fifo_age() {
         let mut cache = CandidateCache::default();
         for index in 0..MAX_CACHE_ENTRIES {
-            cache.resolve(query(&unique_text(0x1000 + index as u32, 1)), empty).unwrap();
+            cache
+                .resolve(query(&unique_text(0x1000 + index as u32, 1)), empty)
+                .unwrap();
         }
         cache
-            .resolve(query(&unique_text(0x1000, 1)), |_| panic!("expected a cache hit"))
+            .resolve(query(&unique_text(0x1000, 1)), |_| {
+                panic!("expected a cache hit")
+            })
             .unwrap();
         cache.resolve(query("new"), empty).unwrap();
         assert_eq!(&*cache.entries.front().unwrap().characters, [0x1001]);
-        assert!(!cache.entries.iter().any(|entry| &*entry.characters == [0x1000]));
+        assert!(
+            !cache
+                .entries
+                .iter()
+                .any(|entry| &*entry.characters == [0x1000])
+        );
     }
 
     #[test]
@@ -926,12 +978,18 @@ mod tests {
 
         // Key-budget eviction must release candidate accounting too.
         let text = unique_text(0x10000, MAX_CACHE_KEY_BYTES / std::mem::size_of::<u32>());
-        let request = Query { family: "", locale: "", ..query(&text) };
+        let request = Query {
+            family: "",
+            locale: "",
+            ..query(&text)
+        };
         cache.resolve(request, empty).unwrap();
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(cache.key_bytes, MAX_CACHE_KEY_BYTES);
         assert_eq!(cache.candidate_bytes, 0);
-        cache.resolve(request, |_| panic!("inclusive key budget must cache")).unwrap();
+        cache
+            .resolve(request, |_| panic!("inclusive key budget must cache"))
+            .unwrap();
     }
 
     #[test]
@@ -1015,7 +1073,9 @@ mod primary_tests {
         ));
         assert!(resolver.primary_family("IBM Plex Sans", &[]).is_err());
         assert_eq!(
-            resolver.primary_family("IBM Plex Sans", &available).unwrap(),
+            resolver
+                .primary_family("IBM Plex Sans", &available)
+                .unwrap(),
             "IBM Plex Sans"
         );
 
@@ -1026,7 +1086,9 @@ mod primary_tests {
         assert_eq!(candidates[0].index, 0);
         assert!(candidates[0].file.ends_with("IBMPlexSans-Regular.ttf"));
         assert_eq!(
-            resolver.primary_family("IBM Plex Sans", &available).unwrap(),
+            resolver
+                .primary_family("IBM Plex Sans", &available)
+                .unwrap(),
             "IBM Plex Sans"
         );
     }

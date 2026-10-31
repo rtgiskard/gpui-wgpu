@@ -1373,7 +1373,8 @@ impl App {
         let result = callback(self);
         let entities_accessed_in_callback =
             mem::replace(self.entities.accessed_entities.get_mut(), outer_accessed);
-        self.entities.extend_accessed(&entities_accessed_in_callback);
+        self.entities
+            .extend_accessed(&entities_accessed_in_callback);
         (result, entities_accessed_in_callback)
     }
 

@@ -1116,6 +1116,13 @@ pub(crate) struct PrepaintStateIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+/// The inherited group state that can change descendant painting, but not hit testing.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GroupPaintContext {
+    hidden: bool,
+    isolated: bool,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
@@ -1124,6 +1131,7 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    window_control_hitboxes_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -1334,6 +1342,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    pub(crate) group_paint_context: GroupPaintContext,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2159,14 +2168,7 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move || {
                 handle
-                    .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
-                            }
-                        }
-                        None
-                    })
+                    .update(&mut cx, |_, window, _cx| window.hit_test_window_control())
                     .log_err()
                     .unwrap_or(None)
             })
@@ -2252,6 +2254,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            group_paint_context: GroupPaintContext::default(),
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -4202,6 +4205,7 @@ impl Window {
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            window_control_hitboxes_index: self.next_frame.window_control_hitboxes.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -4220,6 +4224,12 @@ impl Window {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
+                .iter()
+                .cloned(),
+        );
+        self.next_frame.window_control_hitboxes.extend(
+            self.rendered_frame.window_control_hitboxes[range.start.window_control_hitboxes_index
+                ..range.end.window_control_hitboxes_index]
                 .iter()
                 .cloned(),
         );
@@ -5544,6 +5554,14 @@ impl Window {
     pub fn insert_window_control_hitbox(&mut self, area: WindowControlArea, hitbox: Hitbox) {
         self.invalidator.debug_assert_paint();
         self.next_frame.window_control_hitboxes.push((area, hitbox));
+    }
+
+    fn hit_test_window_control(&self) -> Option<WindowControlArea> {
+        self.rendered_frame
+            .window_control_hitboxes
+            .iter()
+            .find(|(_, hitbox)| self.mouse_hit_test.ids.contains(&hitbox.id))
+            .map(|(area, _)| *area)
     }
 
     /// Sets the key context for the current element. This context will be used to translate
@@ -8200,7 +8218,11 @@ mod tests {
                         let quads = &window.rendered_frame.scene.quads;
                         assert_eq!(quads.len(), 1);
                         let alpha = quads.first().expect("child quad").background.solid.a;
-                        (alpha, child.read(cx).renders, window.simulate_next_frame(cx))
+                        (
+                            alpha,
+                            child.read(cx).renders,
+                            window.simulate_next_frame(cx),
+                        )
                     })
                     .expect("draw window");
                 if requested_frames == 0 {
@@ -8244,7 +8266,6 @@ mod tests {
         assert_eq!(update_and_draw(window, &child, cx, widen).0, 1.);
     }
 
-
     #[gpui::test]
     fn test_native_close_defers_app_access(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
@@ -8262,11 +8283,148 @@ mod tests {
     fn test_native_close_after_app_driven_close(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
         let platform_window = cx.test_window(window.into());
-        window.update(cx, |_, window, _| window.remove_window()).unwrap();
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
         platform_window.simulate_close();
         platform_window.simulate_close();
         cx.run_until_parked();
         assert!(!cx.app.borrow().windows.contains_key(window.window_id()));
+    }
+
+    #[gpui::test]
+    fn cached_children_follow_inherited_opacity_changes(cx: &mut TestAppContext) {
+        struct Child;
+        impl Render for Child {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().bg(crate::red())
+            }
+        }
+        struct Root {
+            child: crate::Entity<Child>,
+            opacity: f32,
+        }
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().opacity(0.5).child(
+                    div().size_full().opacity(self.opacity).child(
+                        self.child
+                            .clone()
+                            .cached(crate::StyleRefinement::default().size(px(40.))),
+                    ),
+                )
+            }
+        }
+        let window = cx.add_window(|_, cx| Root {
+            child: cx.new(|_| Child),
+            opacity: 1.,
+        });
+        for opacity in [1., 1., 0.25, 0.25, 0., 0., 0.5, 0.5, 1.] {
+            window
+                .update(cx, |root, _, cx| {
+                    root.opacity = opacity;
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let alpha: f32 = window
+                    .rendered_frame
+                    .scene
+                    .quads
+                    .iter()
+                    .map(|quad| quad.background.solid.a)
+                    .sum();
+                assert_eq!(
+                    alpha,
+                    opacity * 0.5,
+                    "cached alpha after parent opacity={opacity}"
+                );
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn cached_window_controls_remain_hittable_after_parent_notify(cx: &mut TestAppContext) {
+        struct Child(Rc<Cell<usize>>);
+        impl Render for Child {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.set(self.0.get() + 1);
+                div()
+                    .size_full()
+                    .window_control_area(crate::WindowControlArea::Drag)
+            }
+        }
+        struct Root(crate::Entity<Child>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0
+                    .clone()
+                    .cached(crate::StyleRefinement::default().size(px(40.)))
+            }
+        }
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let renders = renders.clone();
+            move |_, cx| Root(cx.new(|_| Child(renders)))
+        });
+        let mut cached_renders = None;
+        for _ in 0..3 {
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(point(px(5.), px(5.)), cx);
+                assert_eq!(
+                    window.hit_test_window_control(),
+                    Some(crate::WindowControlArea::Drag)
+                );
+                window.simulate_mouse_move(point(px(50.), px(50.)), cx);
+                assert_eq!(window.hit_test_window_control(), None);
+            })
+            .unwrap();
+            assert_eq!(*cached_renders.get_or_insert(renders.get()), renders.get());
+        }
+    }
+
+    #[gpui::test]
+    fn cached_pixel_bounds_invalidate_for_effective_rem_size(cx: &mut TestAppContext) {
+        struct Child;
+        impl Render for Child {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size(crate::rems(1.)).bg(crate::red())
+            }
+        }
+        struct Root(crate::Entity<Child>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0
+                    .clone()
+                    .cached(crate::StyleRefinement::default().size(px(40.)))
+            }
+        }
+        let window = cx.add_window(|_, cx| Root(cx.new(|_| Child)));
+        for rem in [16., 16., 20., 20., 16.] {
+            window
+                .update(cx, |_, window, cx| {
+                    window.set_rem_size(px(rem));
+                    cx.notify();
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let quads = &window.rendered_frame.scene.quads;
+                assert_eq!(quads.len(), 1);
+                assert_eq!(
+                    quads[0].bounds.size,
+                    size(
+                        ScaledPixels(rem * window.scale_factor()),
+                        ScaledPixels(rem * window.scale_factor())
+                    )
+                );
+            })
+            .unwrap();
+        }
     }
 
     #[test]

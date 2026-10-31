@@ -52,8 +52,8 @@ use collections::{FxHashMap, FxHashSet};
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use image::RgbaImage;
-use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, DynamicImage, Frame};
+use image::codecs::{gif::GifDecoder, webp::WebPDecoder};
+use image::{AnimationDecoder as _, DynamicImage, Frame, ImageDecoder as _};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -3322,7 +3322,7 @@ pub(crate) fn decode_static_image(
     decode_static_image_from_decoder(decoder)
 }
 
-pub(crate) fn decode_static_image_from_decoder(
+fn decode_static_image_from_decoder(
     mut decoder: impl image::ImageDecoder,
 ) -> Result<SmallVec<[Frame; 1]>> {
     let orientation = decoder
@@ -3337,6 +3337,40 @@ pub(crate) fn decode_static_image_from_decoder(
     }
 
     Ok(SmallVec::from_elem(Frame::new(data), 1))
+}
+
+pub(crate) fn decode_webp_image(bytes: &[u8]) -> Result<SmallVec<[Frame; 1]>> {
+    let mut decoder = WebPDecoder::new(Cursor::new(bytes))?;
+    if !decoder.has_animation() {
+        return decode_static_image_from_decoder(decoder);
+    }
+
+    let orientation = decoder
+        .orientation()
+        .context("reading decoder's orientation")?;
+    let _ = decoder.set_background_color(image::Rgba([0, 0, 0, 0]));
+    let mut frames = SmallVec::new();
+    for frame in decoder.into_frames() {
+        match frame {
+            Ok(frame) => {
+                let delay = frame.delay();
+                let mut image = DynamicImage::ImageRgba8(frame.into_buffer());
+                image.apply_orientation(orientation);
+                let mut data = image.into_rgba8();
+                // RenderImage stores BGRA pixels, including animated frames.
+                for pixel in data.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                frames.push(Frame::from_parts(data, 0, 0, delay));
+            }
+            Err(err) => log::debug!("Skipping WebP frame due to decode error: {err}"),
+        }
+    }
+
+    if frames.is_empty() {
+        anyhow::bail!("WebP could not be decoded: all frames failed");
+    }
+    Ok(frames)
 }
 
 impl Hash for Image {
@@ -3429,7 +3463,7 @@ impl Image {
             }
             ImageFormat::Png => decode_static_image(&self.bytes, image::ImageFormat::Png)?,
             ImageFormat::Jpeg => decode_static_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => decode_static_image(&self.bytes, image::ImageFormat::WebP)?,
+            ImageFormat::Webp => decode_webp_image(&self.bytes)?,
             ImageFormat::Bmp => decode_static_image(&self.bytes, image::ImageFormat::Bmp)?,
             ImageFormat::Tiff => decode_static_image(&self.bytes, image::ImageFormat::Tiff)?,
             ImageFormat::Ico => decode_static_image(&self.bytes, image::ImageFormat::Ico)?,

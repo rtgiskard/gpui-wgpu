@@ -662,6 +662,109 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[crate::test]
+    fn cached_accessible_views_rebuild_tree_and_actions_after_sibling_notify(
+        cx: &mut crate::TestAppContext,
+    ) {
+        use crate::{prelude::*, *};
+        use std::{cell::Cell, rc::Rc};
+
+        struct Control {
+            focus: FocusHandle,
+            clicks: Rc<Cell<usize>>,
+        }
+        impl Render for Control {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                div()
+                    .id("cached-accessible-control")
+                    .size_full()
+                    .role(Role::Button)
+                    .aria_label("cached accessible control")
+                    .track_focus(&self.focus)
+                    .on_a11y_action(accesskit::Action::Click, move |_, _, _| {
+                        clicks.set(clicks.get() + 1);
+                    })
+            }
+        }
+        struct Root {
+            control: Entity<Control>,
+            sibling: Entity<EmptyView>,
+        }
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .relative()
+                    .size_full()
+                    .child(
+                        self.control.clone().cached(
+                            StyleRefinement::default()
+                                .absolute()
+                                .left(px(11.))
+                                .top(px(13.))
+                                .ml(px(7.))
+                                .mt(px(5.))
+                                .size(px(40.)),
+                        ),
+                    )
+                    .child(self.sibling.clone())
+            }
+        }
+        let clicks = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let clicks = clicks.clone();
+            move |window, cx| {
+                window.a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, None);
+                Root {
+                    control: cx.new(|cx| Control {
+                        focus: cx.focus_handle(),
+                        clicks,
+                    }),
+                    sibling: cx.new(|_| EmptyView),
+                }
+            }
+        });
+        for frame in 0..3 {
+            window
+                .update(cx, |root, _, cx| {
+                    root.sibling.update(cx, |_, cx| cx.notify());
+                })
+                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                assert!(
+                    window
+                        .a11y
+                        .debug_tree_json()
+                        .unwrap()
+                        .contains("cached accessible control")
+                );
+                assert_eq!(window.a11y.action_listeners.len(), 1);
+                let node = *window.a11y.action_listeners.keys().next().unwrap();
+                assert_eq!(
+                    window.a11y.node_bounds.get(&node),
+                    Some(&Bounds::new(
+                        point(px(18.), px(18.)),
+                        size(px(40.), px(40.)),
+                    ))
+                );
+                assert!(window.a11y.focus_ids.contains_key(&node));
+                window.handle_a11y_action(
+                    accesskit::ActionRequest {
+                        action: accesskit::Action::Click,
+                        target_tree: accesskit::TreeId::ROOT,
+                        target_node: node,
+                        data: None,
+                    },
+                    cx,
+                );
+                assert_eq!(clicks.get(), frame + 1);
+            })
+            .unwrap();
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[crate::test]
     fn native_focus_guard_checks_live_scope_before_listeners(cx: &mut crate::TestAppContext) {
         use crate::{prelude::*, *};
         use std::{

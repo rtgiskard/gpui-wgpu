@@ -155,6 +155,93 @@ fn gpu_material_maintenance_drains_idle_work_preserves_visible_uploads_and_resto
     Ok(())
 }
 
+fn underline_alpha_pixels(mut renderer: WgpuHeadlessRenderer) -> anyhow::Result<()> {
+    let viewport = size(48, 24);
+    let area = bounds(0.0, 0.0, 48.0, 24.0);
+    let render = |renderer: &mut WgpuHeadlessRenderer, wavy, alpha, background| {
+        let mut scene = Scene::default();
+        if background {
+            scene.insert_primitive(quad(area, gpui::hsla(0.6, 1.0, 0.5, 1.0)));
+        }
+        // Straight underline and strikethrough use this same primitive; put two
+        // straight strokes at different y positions to cover both placements.
+        for y in [4.0, 14.0] {
+            let placement = bounds(2.0, y, 44.0, if wavy { 8.0 } else { 3.0 });
+            scene.insert_primitive(gpui::Underline {
+                order: 0,
+                pad: 0,
+                bounds: placement,
+                content_mask: ContentMask {
+                    bounds: bounds(5.0, 0.0, 38.0, 24.0),
+                },
+                color: gpui::hsla(0.0, 1.0, 0.5, alpha),
+                thickness: 3.0.into(),
+                wavy: wavy.into(),
+            });
+        }
+        // A full-coverage quad provides an independent source-over reference.
+        scene.insert_primitive(quad(
+            bounds(0.0, 0.0, 4.0, 3.0),
+            gpui::hsla(0.0, 1.0, 0.5, alpha),
+        ));
+        scene.finish();
+        renderer.ensure_render_target(viewport)?;
+        let view = renderer.render_target.as_ref().unwrap().view.clone();
+        renderer
+            .core
+            .render_frame(&scene, &view, viewport, true, wgpu::Color::TRANSPARENT)?;
+        renderer.read_image()
+    };
+    for background in [false, true] {
+        let straight = render(&mut renderer, false, 0.5, background)?;
+        let reference = straight.get_pixel(1, 1).0;
+        if !background {
+            assert!(
+                reference[3].abs_diff(128) <= 2,
+                "quad reference: {reference:?}"
+            );
+        }
+        for y in [5, 15] {
+            pixel(&straight, 20, y, reference);
+            // The content mask must still clip both straight strokes.
+            let clipped = straight.get_pixel(4, y).0;
+            assert_eq!(clipped, straight.get_pixel(47, y).0);
+        }
+        let opaque = render(&mut renderer, true, 1.0, background)?;
+        let translucent = render(&mut renderer, true, 0.5, background)?;
+        let backdrop = opaque.get_pixel(47, 12).0;
+        let mut covered = 0;
+        let mut antialiased = 0;
+        for y in 4..22 {
+            for x in 5..43 {
+                let full = opaque.get_pixel(x, y).0;
+                let half = translucent.get_pixel(x, y).0;
+                // These are actual GPU coverage pixels, not a duplicated wave
+                // formula. Source-over is affine in source alpha on this UNORM
+                // target, including fractional AA coverage and colored backdrops.
+                let expected = std::array::from_fn(|channel| {
+                    ((u16::from(full[channel]) + u16::from(backdrop[channel]) + 1) / 2) as u8
+                });
+                pixel(&translucent, x, y, expected);
+                if full != backdrop {
+                    covered += 1;
+                }
+                if !background && full[3] > 0 && full[3] < 250 {
+                    antialiased += 1;
+                }
+                if !background && full[3] >= 250 {
+                    assert!(half[3].abs_diff(128) <= 3, "wave alpha: {half:?}");
+                }
+            }
+        }
+        assert!(covered > 20, "wave must render visible coverage");
+        if !background {
+            assert!(antialiased > 10, "wave must exercise AA pixels");
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn gpu_material_maintenance_handles_do_not_pin_recovered_or_closed_renderer() -> anyhow::Result<()>
 {
@@ -237,6 +324,34 @@ fn dynamic_preparation_releases_cpu_publications_without_another_frame() -> anyh
         drop(renderer);
     }
     Ok(())
+}
+
+#[test]
+fn underline_alpha_matches_quad_and_wave_coverage() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    renderer.core = WgpuRendererCore::new(
+        &renderer.context,
+        Arc::new(WgpuAtlas::from_context(&renderer.context)),
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::CompositeAlphaMode::PreMultiplied,
+    );
+    underline_alpha_pixels(renderer)
+}
+
+#[test]
+fn underline_alpha_matches_quad_and_wave_coverage_webgl_transport() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    renderer.core = WgpuRendererCore::new(
+        &renderer.context,
+        Arc::new(WgpuAtlas::from_context(&renderer.context)),
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::CompositeAlphaMode::PreMultiplied,
+    );
+    renderer.core.use_webgl_instance_data_for_test();
+    renderer
+        .core
+        .update_alpha_mode(wgpu::CompositeAlphaMode::PreMultiplied);
+    underline_alpha_pixels(renderer)
 }
 
 #[test]

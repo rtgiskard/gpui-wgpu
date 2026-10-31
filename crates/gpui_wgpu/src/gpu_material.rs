@@ -732,6 +732,11 @@ impl MaterialRenderer {
                 wgpu::BufferUsages::UNIFORM,
                 "GPU frame placements",
                 |mapped| {
+                    for slot in 0..prepared.draws.len() - 1 {
+                        let start = slot * placement_stride as usize + PLACEMENT_SIZE as usize;
+                        let end = (slot + 1) * placement_stride as usize;
+                        mapped.slice(start..end).fill(0);
+                    }
                     for (&index, draw) in &prepared.draws {
                         let offset = draw.placement_offset as usize;
                         encode_placement(
@@ -1030,17 +1035,22 @@ fn encode_frame(bytes: &mut wgpu::WriteOnly<'_, [u8]>, frame: &GpuFrame) {
                 let offset = index * RECTANGLE_STRIDE as usize;
                 put_floats(bytes, offset, &rectangle.bounds);
                 put_floats(bytes, offset + 16, &rectangle.palette_range);
+                bytes
+                    .slice(offset + 24..offset + RECTANGLE_STRIDE as usize)
+                    .fill(0);
             }
         }
         GpuContent::Segments { segments, layers } => {
             for (index, layer) in layers.iter().enumerate() {
                 put_floats(bytes, index * 16, &[layer.width]);
                 put_u32(bytes, index * 16 + 4, layer.palette_offset);
+                bytes.slice(index * 16 + 8..(index + 1) * 16).fill(0);
             }
             for (index, segment) in segments.iter().enumerate() {
                 let offset = layers.len() * 16 + index * 32;
                 put_floats(bytes, offset, &segment.endpoints);
                 put_u32(bytes, offset + 16, segment.color);
+                bytes.slice(offset + 20..offset + 32).fill(0);
             }
         }
         GpuContent::Field {
@@ -1079,9 +1089,10 @@ fn encode_placement(
     premultiplied: bool,
     srgb: bool,
 ) {
+    // Schemas leave reserved fields unused; initialize them on every placement.
+    bytes.fill(0);
     let bounds = batch.bounds;
     let mask = batch.content_mask.bounds;
-    put_floats(bytes, 112, &[0.0, 0.0]);
     put_floats(
         bytes,
         0,

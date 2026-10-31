@@ -762,7 +762,8 @@ mod tests {
     #[gpui::test]
     fn measured_leaf_preserves_content_space_and_device_pixel_snapping(cx: &mut TestAppContext) {
         let mut cx = cx.add_empty_window();
-        for (scale_factor, content_width, intrinsic_height) in [(1.0, 90.0, 21.0), (1.25, 90.4, 20.0)]
+        for (scale_factor, content_width, intrinsic_height) in
+            [(1.0, 90.0, 21.0), (1.25, 90.4, 20.0)]
         {
             cx.simulate_scale_factor_change(scale_factor);
             for (measured_height, constrained, expected_height) in [
@@ -831,18 +832,14 @@ mod tests {
                 let absolute = engine.request_layout(absolute_style, px(16.0), scale_factor, &[]);
                 let mut parent_style = Style::default();
                 parent_style.size = size(px(100.0).into(), px(80.0).into());
-                let parent = engine.request_layout(parent_style, px(16.0), scale_factor, &[absolute]);
+                let parent =
+                    engine.request_layout(parent_style, px(16.0), scale_factor, &[absolute]);
                 let mut root_style = Style::default();
                 root_style.size = size(px(400.0).into(), px(200.0).into());
                 root_style.padding.left = px(10.0).into();
                 root_style.padding.top = px(20.0).into();
                 let root = engine.request_layout(root_style, px(16.0), scale_factor, &[parent]);
-                engine.compute_layout(
-                    root,
-                    size(px(400.0), px(200.0)).into(),
-                    window,
-                    cx,
-                );
+                engine.compute_layout(root, size(px(400.0), px(200.0)).into(), window, cx);
                 // The intermediate GPUI default remains relative, not Taffy's
                 // static default: percentages resolve against its 100x80 box.
                 assert_eq!(

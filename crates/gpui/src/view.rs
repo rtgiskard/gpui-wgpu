@@ -40,9 +40,10 @@ impl<V: Render> From<Entity<V>> for AnyView {
 impl AnyView {
     /// Embed this view as a cached [`ViewElement`] laid out at `style`.
     ///
-    /// The rendered subtree is recycled from the previous frame unless
-    /// [Context::notify] was called on the backing entity since it was rendered
-    /// (or [Window::refresh] is called, which ignores caching).
+    /// The rendered subtree is reused while its entity and inherited render context
+    /// are unchanged. [Context::notify] and [Window::refresh] invalidate it.
+    /// Active accessibility disables subtree reuse while retaining `style` for layout.
+    /// Inspector picking bypasses caching.
     pub fn cached(self, style: StyleRefinement) -> ViewElement<AnyView> {
         self.into_element().cached(style)
     }
@@ -241,8 +242,10 @@ impl<T: Render> View for Entity<T> {
 impl<T: Render> Entity<T> {
     /// Embed this entity as a cached [`ViewElement`] laid out at `style`.
     ///
-    /// The rendered subtree is reused until the entity is notified (or the
-    /// cached bounds / text style change). Caching requires a definite size:
+    /// The rendered subtree is reused while the entity, bounds, and inherited render
+    /// context (mask, text style, rem size, opacity, and paint-only group state) are unchanged.
+    /// Active accessibility disables subtree reuse while retaining `style` for layout.
+    /// Inspector picking bypasses caching. Caching requires a definite size:
     /// a cached view is laid out from `style` and is *not* measured from its
     /// contents. Use [`ViewElement::new`] (or `.child(entity)`) for the
     /// uncached case.
@@ -323,7 +326,9 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    rem_size: Pixels,
     opacity: f32,
+    group_paint_context: crate::window::GroupPaintContext,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -529,14 +534,21 @@ fn prepaint_view(
                 let text_style = window.text_style();
                 let opacity = window.element_opacity();
 
+                let rem_size = window.rem_size();
+                let group_paint_context = window.group_paint_context;
+
                 // Compare bits so NaN opacity still matches itself and reuses the cache.
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
+                    && element_state.cache_key.rem_size == rem_size
                     && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
+                    && element_state.cache_key.group_paint_context == group_paint_context
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    // Accessibility nodes, focus, bounds, and actions are rebuilt every frame.
+                    && !window.is_a11y_active()
                 {
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
@@ -570,7 +582,9 @@ fn prepaint_view(
                             bounds,
                             content_mask,
                             text_style,
+                            rem_size,
                             opacity,
+                            group_paint_context,
                         },
                     },
                 )

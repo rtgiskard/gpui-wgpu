@@ -1351,7 +1351,10 @@ mod font_resolution_tests {
         let generation = text_system.font_generation.load(Ordering::Acquire);
         text_system.add_fonts(Vec::new()).unwrap();
         assert!(text_system.font_ids_by_font.read().is_empty());
-        assert_eq!(text_system.font_generation.load(Ordering::Acquire), generation + 1);
+        assert_eq!(
+            text_system.font_generation.load(Ordering::Acquire),
+            generation + 1
+        );
         assert_eq!(text_system.resolve_font(&requested), FontId(1));
         assert_eq!(text_system.get_font_for_id(FontId(1)), Some(requested));
     }
@@ -1378,7 +1381,6 @@ mod line_wrapper_pool_tests {
         assert!(weak_text_system.upgrade().is_none());
     }
 }
-
 
 #[cfg(test)]
 mod missing_glyph_tests {

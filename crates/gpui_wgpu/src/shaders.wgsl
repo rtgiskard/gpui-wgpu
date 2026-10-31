@@ -1182,7 +1182,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let underline = load_underline(input.underline_id);
     if (underline.wavy == 0u)
     {
-        return blend_color(input.color, input.color.a);
+        return blend_color(input.color, 1.0);
     }
 
     let half_thickness = underline.thickness * 0.5;
@@ -1198,7 +1198,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return blend_color(input.color, alpha);
 }
 
 // --- monochrome sprites --- //

@@ -3,16 +3,13 @@ use crate::{
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
     SharedString, SharedUri, StyleRefinement, Styled, Task, Transformation, Window,
-    decode_static_image, decode_static_image_from_decoder, px,
+    decode_static_image, decode_webp_image, px,
 };
 use anyhow::Result;
 
 use futures::Future;
 use gpui_util::ResultExt;
-use image::{
-    AnimationDecoder, ImageError, ImageFormat, Rgba,
-    codecs::{gif::GifDecoder, webp::WebPDecoder},
-};
+use image::{AnimationDecoder, ImageError, ImageFormat, codecs::gif::GifDecoder};
 use scheduler::Instant;
 use smallvec::SmallVec;
 use std::{
@@ -438,15 +435,6 @@ impl Element for Img {
                                     _ => Length::Definite(image_size.height.into()),
                                 };
                             }
-
-                            if global_id.is_some()
-                                && self.automatic_animation_frames
-                                && data.frame_count() > 1
-                                && window.is_window_active()
-                                && !cx.reduce_motion()
-                            {
-                                window.request_animation_frame();
-                            }
                         }
                         Some(_err) => {
                             if let Some(fallback) = self.style.fallback.as_ref() {
@@ -529,7 +517,7 @@ impl Element for Img {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let source = self.source.clone();
+        let source = &self.source;
         self.interactivity.paint(
             global_id,
             inspector_id,
@@ -547,6 +535,19 @@ impl Element for Img {
                 ) {
                     if data.frame_count() == 0 {
                         return;
+                    }
+
+                    // Hidden elements never reach this paint continuation. Use its
+                    // final computed display, rather than the layout-time style,
+                    // without changing cursor advancement or paint bookkeeping.
+                    if style.display != crate::Display::None
+                        && global_id.is_some()
+                        && self.automatic_animation_frames
+                        && data.frame_count() > 1
+                        && window.is_window_active()
+                        && !cx.reduce_motion()
+                    {
+                        window.request_animation_frame();
                     }
                     let new_bounds = self
                         .style
@@ -759,41 +760,7 @@ impl Asset for ImageAssetLoader {
 
                         frames
                     }
-                    ImageFormat::WebP => {
-                        let mut decoder = WebPDecoder::new(Cursor::new(&bytes))?;
-
-                        if decoder.has_animation() {
-                            let _ = decoder.set_background_color(Rgba([0, 0, 0, 0]));
-                            let mut frames = SmallVec::new();
-
-                            for frame in decoder.into_frames() {
-                                match frame {
-                                    Ok(mut frame) => {
-                                        // Convert from RGBA to BGRA.
-                                        for pixel in frame.buffer_mut().chunks_exact_mut(4) {
-                                            pixel.swap(0, 2);
-                                        }
-                                        frames.push(frame);
-                                    }
-                                    Err(err) => {
-                                        log::debug!(
-                                            "Skipping WebP frame in {source:?} due to decode error: {err}"
-                                        );
-                                    }
-                                }
-                            }
-
-                            if frames.is_empty() {
-                                return Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
-                                    "WebP could not be decoded: all frames failed ({source:?})"
-                                ))));
-                            }
-
-                            frames
-                        } else {
-                            decode_static_image_from_decoder(decoder)?
-                        }
-                    }
+                    ImageFormat::WebP => decode_webp_image(&bytes)?,
                     _ => decode_static_image(&bytes, format)?,
                 };
 
@@ -1071,6 +1038,184 @@ mod tests {
                 usize::from(automatic),
                 "ordinary Img retains automatic animation requests",
             );
+        }
+    }
+
+    #[gpui::test]
+    fn hidden_animated_images_stop_requesting_frames_and_resume_when_visible(
+        cx: &mut TestAppContext,
+    ) {
+        struct AnimationView {
+            hidden_mode: usize,
+            image: Arc<RenderImage>,
+        }
+
+        impl crate::Render for AnimationView {
+            fn render(&mut self, _: &mut Window, _: &mut crate::Context<Self>) -> impl IntoElement {
+                let mut image = img(self.image.clone()).id(TEST_IMG_ID).size(px(10.));
+                if self.hidden_mode == 1 {
+                    image = image.invisible();
+                } else if self.hidden_mode == 2 {
+                    image = image.hidden();
+                }
+                let mut parent = div().child(image);
+                if self.hidden_mode == 3 {
+                    parent = parent.invisible();
+                }
+                parent
+            }
+        }
+
+        let window = cx.add_empty_window();
+        window.update(|window, _| window.activate_window());
+        window.run_until_parked();
+        let view = window.update(|_, cx| {
+            cx.new(|_| AnimationView {
+                hidden_mode: 0,
+                image: test_image(2),
+            })
+        });
+
+        for hidden_mode in [1, 2, 3] {
+            window.update(|_, cx| view.update(cx, |view, _| view.hidden_mode = hidden_mode));
+            for _ in 0..2 {
+                window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+                    view.clone().into_any_element()
+                });
+                assert_eq!(
+                    window.update(|window, cx| window.simulate_next_frame(cx)),
+                    0,
+                    "hidden mode {hidden_mode} must not sustain animation callbacks",
+                );
+            }
+
+            window.update(|_, cx| view.update(cx, |view, _| view.hidden_mode = 0));
+            window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+                view.clone().into_any_element()
+            });
+            assert_eq!(
+                window.update(|window, cx| window.simulate_next_frame(cx)),
+                1,
+                "showing an animated image must restore animation demand",
+            );
+            window.update(|window, _| {
+                assert!(window.rendered_frame.scene.polychrome_sprites.last().is_some());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn hovered_animated_images_use_final_visibility_for_frame_requests(cx: &mut TestAppContext) {
+        struct AnimationView;
+
+        impl crate::Render for AnimationView {
+            fn render(&mut self, _: &mut Window, _: &mut crate::Context<Self>) -> impl IntoElement {
+                img(test_image(2))
+                    .id(TEST_IMG_ID)
+                    .size(px(20.))
+                    .hover(|style| style.invisible())
+            }
+        }
+
+        let window = cx.open_window(size(px(100.), px(100.)), |_, _| AnimationView);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.activate_window();
+            window.simulate_mouse_move(point(px(10.), px(10.)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let requests = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_next_frame(cx)
+            })
+            .unwrap();
+        assert_eq!(requests, 0, "hover-hidden image must not request another frame");
+
+        let requests = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.simulate_mouse_move(point(px(50.), px(50.)), cx);
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.simulate_next_frame(cx)
+            })
+            .unwrap();
+        assert!(requests > 0, "leaving the image must restore animation demand");
+    }
+
+    #[gpui::test]
+    fn fully_clipped_animated_images_keep_requesting_frames(cx: &mut TestAppContext) {
+        struct AnimationView;
+
+        impl crate::Render for AnimationView {
+            fn render(&mut self, _: &mut Window, _: &mut crate::Context<Self>) -> impl IntoElement {
+                div()
+                    .size(px(10.))
+                    .overflow_hidden()
+                    .child(img(test_image(2)).id(TEST_IMG_ID).size(px(10.)).ml(px(20.)))
+            }
+        }
+
+        let window = cx.add_empty_window();
+        window.update(|window, _| window.activate_window());
+        window.run_until_parked();
+        let view = window.update(|_, cx| cx.new(|_| AnimationView));
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(window.update(|window, cx| window.simulate_next_frame(cx)), 1);
+    }
+
+    #[gpui::test]
+    fn image_and_resource_sources_decode_webp_pixels_and_delays_identically(cx: &mut TestAppContext) {
+        // Non-square frames with EXIF Orientation 6 must rotate clockwise.
+        let animated_frames: &[(&[u8], u64)] = &[
+            (&[0x77, 0x22, 0x11, 0x80, 0xC3, 0xB2, 0xA1, 0xD0], 70),
+            (&[0x33, 0x44, 0x99, 0x40, 0x65, 0x43, 0x21, 0xE0], 130),
+        ];
+        let static_frames: &[(&[u8], u64)] = &[(&[0x77, 0x22, 0x11, 0x80], 0)];
+        for (fixture, bytes, expected_size, expected_frames) in [
+            (
+                "two-frame-alpha.webp",
+                include_bytes!("../../examples/image/two-frame-alpha.webp").as_slice(),
+                size(1.into(), 2.into()),
+                animated_frames,
+            ),
+            (
+                "single-frame-alpha.webp",
+                include_bytes!("../../examples/image/single-frame-alpha.webp").as_slice(),
+                size(1.into(), 1.into()),
+                static_frames,
+            ),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/image")
+                .join(fixture);
+            let image = Image::from_bytes(crate::ImageFormat::Webp, bytes.to_vec());
+            let image_decoded = cx
+                .update(|cx| image.to_image_data(cx.svg_renderer()))
+                .expect("synthetic WebP image should decode");
+            let resource_decoded = cx
+                .update(|cx| {
+                    futures::executor::block_on(ImageAssetLoader::load(Resource::from(path), cx))
+                })
+                .expect("synthetic WebP resource should decode");
+            for decoded in [image_decoded, resource_decoded] {
+                assert_eq!(decoded.frame_count(), expected_frames.len(), "{fixture}");
+                for (index, (pixel, delay_ms)) in expected_frames.iter().enumerate() {
+                    assert_eq!(decoded.size(index), expected_size, "{fixture} frame {index}");
+                    assert_eq!(
+                        decoded.as_bytes(index).unwrap(),
+                        *pixel,
+                        "{fixture} frame {index}"
+                    );
+                    assert_eq!(
+                        Duration::from(decoded.delay(index)),
+                        Duration::from_millis(*delay_ms),
+                        "{fixture} frame {index}",
+                    );
+                }
+            }
         }
     }
 

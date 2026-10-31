@@ -1528,6 +1528,23 @@ impl WgpuRendererCore {
         &mut self.resources
     }
 
+    #[cfg(test)]
+    fn use_webgl_instance_data_for_test(&mut self) {
+        self.uses_webgl_instance_data = true;
+        self.dual_source_blending = false;
+        self.instance_data_alignment = INSTANCE_TEXTURE_TEXEL_SIZE;
+        self.max_instance_data_size = (u64::from(self.max_texture_size).pow(2)
+            * INSTANCE_TEXTURE_TEXEL_SIZE)
+            .min(MAX_INSTANCE_BUFFER_SIZE);
+        // Keep globals/atlas layouts and their existing bindings. Only the instance
+        // transport changes; pipelines must be rebuilt against that new layout.
+        self.resources.bind_group_layouts.instances =
+            Self::create_bind_group_layouts(&self.resources.device, true).instances;
+        self.update_alpha_mode(wgpu::CompositeAlphaMode::Opaque);
+        self.replace_instance_data(INITIAL_INSTANCE_DATA_CAPACITY.min(self.max_instance_data_size));
+        self.minimum_instance_data_capacity = self.instance_data_capacity;
+    }
+
     fn update_alpha_mode(&mut self, alpha_mode: wgpu::CompositeAlphaMode) {
         self.resources.pipelines = Self::create_pipelines(
             &self.resources.device,
@@ -1801,44 +1818,46 @@ impl WgpuRendererCore {
         self.material_ranges.clear();
         self.native_rasters.clear();
         let mut extent = (0u32, 0u32);
-        for batch in scene.batches() {
-            match batch {
-                #[cfg(not(target_os = "macos"))]
-                PrimitiveBatch::Gpu(range) => self.material_ranges.push(range),
-                PrimitiveBatch::Paths(range) => {
-                    // Native vertices form one packed intermediate; preserve
-                    // the complete batch and its original composite sprites.
-                    let bounds = scene.paths[range.clone()]
-                        .iter()
-                        .filter(|path| !path.vertices.is_empty())
-                        .map(|path| path.clipped_bounds())
-                        .reduce(|bounds, next| bounds.union(&next));
-                    if let Some(raster) =
-                        bounds.and_then(|bounds| crate::gpu_material::raster_bounds(bounds, size))
-                    {
-                        extent.0 = extent.0.max(raster.size.width.0 as u32);
-                        extent.1 = extent.1.max(raster.size.height.0 as u32);
-                        let paths = &scene.paths[range.clone()];
-                        let vertices = paths.iter().try_fold(0usize, |count, path| {
-                            count
-                                .checked_add(path.vertices.len())
-                                .context("native path vertex count overflow")
-                        })?;
-                        let sprites = if paths.last().map(|path| path.order) == Some(paths[0].order)
+        if !scene.paths.is_empty() || !scene.gpu_draws.is_empty() {
+            for batch in scene.batches() {
+                match batch {
+                    #[cfg(not(target_os = "macos"))]
+                    PrimitiveBatch::Gpu(range) => self.material_ranges.push(range),
+                    PrimitiveBatch::Paths(range) => {
+                        // Native vertices form one packed intermediate; preserve
+                        // the complete batch and its original composite sprites.
+                        let bounds = scene.paths[range.clone()]
+                            .iter()
+                            .filter(|path| !path.vertices.is_empty())
+                            .map(|path| path.clipped_bounds())
+                            .reduce(|bounds, next| bounds.union(&next));
+                        if let Some(raster) = bounds
+                            .and_then(|bounds| crate::gpu_material::raster_bounds(bounds, size))
                         {
-                            paths.len()
-                        } else {
-                            1
-                        };
-                        self.native_rasters.push(NativeRasterBatch {
-                            start: range.start,
-                            raster_bounds: raster,
-                            vertices,
-                            sprites,
-                        });
+                            extent.0 = extent.0.max(raster.size.width.0 as u32);
+                            extent.1 = extent.1.max(raster.size.height.0 as u32);
+                            let paths = &scene.paths[range.clone()];
+                            let vertices = paths.iter().try_fold(0usize, |count, path| {
+                                count
+                                    .checked_add(path.vertices.len())
+                                    .context("native path vertex count overflow")
+                            })?;
+                            let sprites =
+                                if paths.last().map(|path| path.order) == Some(paths[0].order) {
+                                    paths.len()
+                                } else {
+                                    1
+                                };
+                            self.native_rasters.push(NativeRasterBatch {
+                                start: range.start,
+                                raster_bounds: raster,
+                                vertices,
+                                sprites,
+                            });
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         let materials = self.resources.materials.borrow_mut().prepare(
@@ -2160,6 +2179,13 @@ impl WgpuRendererCore {
     }
 
     fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
+        if scene.monochrome_sprites.is_empty()
+            && scene.subpixel_sprites.is_empty()
+            && scene.polychrome_sprites.is_empty()
+        {
+            self.resources_mut().atlas_texture_bind_groups.clear();
+            return;
+        }
         let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
         for batch in scene.batches() {
             let texture_id = match batch {
@@ -2207,7 +2233,7 @@ impl WgpuRendererCore {
 
     fn draw_instances(
         &self,
-        instances: &InstanceBinding,
+        instances: &Option<InstanceBinding>,
         pipeline: &wgpu::RenderPipeline,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
@@ -2215,6 +2241,9 @@ impl WgpuRendererCore {
         if range.is_empty() {
             return;
         }
+        let instances = instances
+            .as_ref()
+            .expect("nonempty instance batch was uploaded");
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
@@ -2226,7 +2255,7 @@ impl WgpuRendererCore {
 
     fn draw_sprites(
         &self,
-        sprite_instances: &InstanceBinding,
+        sprite_instances: &Option<InstanceBinding>,
         texture_id: AtlasTextureId,
         pipeline: &wgpu::RenderPipeline,
         range: Range<u32>,
@@ -2235,6 +2264,9 @@ impl WgpuRendererCore {
         if range.is_empty() {
             return Ok(());
         }
+        let sprite_instances = sprite_instances
+            .as_ref()
+            .expect("nonempty sprite batch was uploaded");
         let resources = self.resources();
         // The atlas has released this texture; the batch belongs to a stale
         // paint that will be replaced once its view re-renders.
@@ -2431,6 +2463,9 @@ impl WgpuRendererCore {
         materials: &PreparedMaterials,
         mut offset: u64,
     ) -> Result<()> {
+        if self.native_rasters.is_empty() && materials.msaa_groups.is_empty() {
+            return Ok(());
+        }
         let mut capacity = self.instance_data_capacity;
         let mut native_raster_index = 0;
         // Initial ordinary instance uploads already advanced offset. Replay the
@@ -4045,6 +4080,79 @@ mod tests {
     #[test]
     fn path_intermediate_textures_follow_msaa_draw_demand() -> anyhow::Result<()> {
         exercise_path_intermediate_lifecycle(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_instance_classes_do_not_exhaust_a_capped_frame() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let capacity = std::mem::size_of::<Quad>() as u64;
+        renderer.core.replace_instance_data(capacity);
+        renderer.core.max_instance_data_size = capacity;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::red()));
+        scene.finish();
+        let size = device_size(16, 16);
+        for _ in 0..2 {
+            let image = renderer.render_scene_to_image(&scene, size)?;
+            assert_pixel(&image, 8, 8, RED);
+            let empty = renderer.render_scene_to_image(&Scene::default(), size)?;
+            assert_pixel(&empty, 8, 8, BLACK);
+        }
+        // A genuinely oversized nonempty upload still fails, then a valid frame recovers.
+        scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::blue()));
+        scene.finish();
+        assert!(renderer.render_scene_no_readback(&scene, size).is_err());
+        scene.clear();
+        scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::blue()));
+        scene.finish();
+        assert_pixel(&renderer.render_scene_to_image(&scene, size)?, 8, 8, BLUE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_instance_classes_preserve_old_allocations_and_retire_atlas_bindings()
+    -> anyhow::Result<()> {
+        for texture_transport in [false, true] {
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            if texture_transport {
+                renderer.core.use_webgl_instance_data_for_test();
+            }
+            renderer.core.replace_instance_data(256);
+            let capacity = renderer.core.instance_data_capacity;
+            let tile = image_tile(&renderer, 987, 1, 1, &[255, 0, 0, 255])?;
+            let bounds = solid_quad(16.0, 0.0, 16.0, 16.0, gpui::blue()).bounds;
+            let mut scene = Scene::default();
+            // Fill the initial allocation with quads, so the later sprite class
+            // must roll onto a replacement while the quad binding stays live.
+            for _ in 0..capacity / std::mem::size_of::<Quad>() as u64 {
+                scene.insert_primitive(solid_quad(0.0, 0.0, 16.0, 16.0, gpui::red()));
+            }
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.0,
+                bounds,
+                content_mask: ContentMask { bounds },
+                corner_radii: Corners::default(),
+                tile,
+                transformation: gpui::TransformationMatrix::default(),
+                source_tile_bounds: tile.bounds,
+                effects: gpui::ImageEffects::default(),
+            });
+            scene.finish();
+            let size = device_size(32, 16);
+            for _ in 0..2 {
+                let image = renderer.render_scene_to_image(&scene, size)?;
+                assert_pixel(&image, 8, 8, RED);
+                assert_pixel(&image, 24, 8, BLUE);
+                renderer.render_scene_no_readback(&Scene::default(), size)?;
+                assert!(renderer.core.resources.atlas_texture_bind_groups.is_empty());
+            }
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

@@ -103,6 +103,7 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.device = context.device.clone();
             textures.queue = context.queue.clone();
+            textures.max_texture_size = context.device.limits().max_texture_dimension_2d;
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
@@ -267,7 +268,12 @@ impl WgpuAtlasTextures {
         Some(tile)
     }
 
-    fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: Cow<'_, [u8]>) {
+    fn upload_texture(
+        &mut self,
+        id: AtlasTextureId,
+        bounds: Bounds<DevicePixels>,
+        bytes: Cow<'_, [u8]>,
+    ) {
         let format = self.storage.get(id).map(|texture| texture.format);
         let data = swizzle_upload_data(bytes, format.unwrap_or(wgpu::TextureFormat::Bgra8Unorm));
         self.pending_uploads
@@ -474,7 +480,11 @@ mod tests {
                         width: DevicePixels(width),
                         height: DevicePixels(height),
                     };
-                    assert!(backend.insert(kind, invalid_size, Cow::Borrowed(&[])).is_err());
+                    assert!(
+                        backend
+                            .insert(kind, invalid_size, Cow::Borrowed(&[]))
+                            .is_err()
+                    );
                     assert_eq!(backend.storage[kind].textures.len(), page_count);
                     assert_eq!(backend.storage[kind].free_list, free_list);
                     assert_eq!(backend.next_texture_generation, generation);
