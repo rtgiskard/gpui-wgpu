@@ -1,4 +1,6 @@
 #[cfg(not(target_family = "wasm"))]
+use crate::{WgpuRenderer, WgpuSurfaceConfig};
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 #[cfg(not(target_family = "wasm"))]
 use gpui_util::ResultExt;
@@ -160,6 +162,7 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn for_window<W>(
         window: &W,
+        config: &WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<(Self, wgpu::Surface<'static>)>
     where
@@ -171,12 +174,13 @@ impl WgpuContext {
             + Clone
             + 'static,
     {
-        Self::new_with_options(window, compositor_gpu, false)
+        Self::new_with_options(window, config, compositor_gpu, false)
     }
 
     #[cfg(not(target_family = "wasm"))]
     pub fn for_window_rejecting_software<W>(
         window: &W,
+        config: &WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<(Self, wgpu::Surface<'static>)>
     where
@@ -188,12 +192,13 @@ impl WgpuContext {
             + Clone
             + 'static,
     {
-        Self::new_with_options(window, compositor_gpu, true)
+        Self::new_with_options(window, config, compositor_gpu, true)
     }
 
     #[cfg(not(target_family = "wasm"))]
     fn new_with_options<W>(
         window: &W,
+        config: &WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         reject_software: bool,
     ) -> anyhow::Result<(Self, wgpu::Surface<'static>)>
@@ -235,6 +240,7 @@ impl WgpuContext {
                     instance,
                     device_id_filter,
                     surface,
+                    config,
                     compositor_gpu.as_ref(),
                     software_only,
                 ))?;
@@ -597,6 +603,7 @@ impl WgpuContext {
         instance: &wgpu::Instance,
         device_id_filter: Option<u32>,
         surface: &wgpu::Surface<'_>,
+        config: &WgpuSurfaceConfig,
         compositor_gpu: Option<&CompositorGpuHint>,
         software_only: bool,
     ) -> anyhow::Result<(
@@ -642,7 +649,7 @@ impl WgpuContext {
 
             log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
 
-            match Self::try_adapter_with_surface(&adapter, surface).await {
+            match Self::try_adapter_with_surface(&adapter, surface, config).await {
                 Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
                     log::info!(
                         "Selected GPU (passed configuration test): {} ({:?})",
@@ -730,6 +737,7 @@ impl WgpuContext {
     async fn try_adapter_with_surface(
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface<'_>,
+        config: &WgpuSurfaceConfig,
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
         let caps = surface.get_capabilities(adapter);
         if caps.formats.is_empty() {
@@ -741,21 +749,12 @@ impl WgpuContext {
 
         let (device, queue, dual_source_blending, color_atlas_texture_format) =
             Self::create_device(adapter).await?;
+        // Validate the exact configuration the renderer will use, avoiding a
+        // second swapchain creation after selecting the adapter.
+        let (surface_config, _, _) =
+            WgpuRenderer::surface_configuration(surface, adapter, &device, config)?;
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-
-        let test_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: caps.formats[0],
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: 64,
-            height: 64,
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-        };
-
-        surface.configure(&device, &test_config);
+        surface.configure(&device, &surface_config);
 
         let error = error_scope.pop().await;
         if let Some(e) = error {
