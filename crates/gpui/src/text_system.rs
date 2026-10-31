@@ -25,6 +25,7 @@ use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::{SmallVec, smallvec};
 use std::{
     borrow::Cow,
+    cell::RefCell,
     cmp,
     collections::VecDeque,
     fmt::{Debug, Display, Formatter},
@@ -236,7 +237,6 @@ pub struct TextSystem {
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<CharWidthCache>>>,
-    font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
     font_generation: Arc<AtomicUsize>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
@@ -261,7 +261,6 @@ impl TextSystem {
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
-            font_runs_pool: Mutex::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -325,8 +324,7 @@ impl TextSystem {
         let metrics = std::mem::take(&mut *self.font_metrics.write());
         let bounds = std::mem::take(&mut *self.raster_bounds.write());
         let wrappers = std::mem::take(&mut *self.wrapper_pool.lock());
-        let runs = std::mem::take(&mut *self.font_runs_pool.lock());
-        drop((metrics, bounds, wrappers, runs));
+        drop((metrics, bounds, wrappers));
     }
 
     /// Takes the receiver for missing-glyph reports.
@@ -659,6 +657,7 @@ impl TextSystem {
 #[derive(Deref)]
 pub struct WindowTextSystem {
     line_layout_cache: LineLayoutCache,
+    font_runs: RefCell<Vec<FontRun>>,
     #[deref]
     text_system: Arc<TextSystem>,
 }
@@ -667,6 +666,7 @@ impl WindowTextSystem {
     /// Create a new WindowTextSystem with the given TextSystem.
     pub fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
+            font_runs: RefCell::default(),
             line_layout_cache: LineLayoutCache::new(
                 text_system.platform_text_system.clone(),
                 text_system.font_generation.clone(),
@@ -746,7 +746,7 @@ impl WindowTextSystem {
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        let mut font_runs = std::mem::take(&mut *self.font_runs.borrow_mut());
 
         let mut lines = SmallVec::new();
         let mut max_wrap_lines = line_clamp;
@@ -859,8 +859,7 @@ impl WindowTextSystem {
             let end = text.len();
             process_line(text, 0, end);
         }
-
-        self.font_runs_pool.lock().push(font_runs);
+        *self.font_runs.borrow_mut() = font_runs;
 
         Ok(lines)
     }
@@ -881,7 +880,7 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
         let mut last_run = None::<&TextRun>;
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        let mut font_runs = std::mem::take(&mut *self.font_runs.borrow_mut());
         font_runs.clear();
 
         for run in runs.iter() {
@@ -918,8 +917,7 @@ impl WindowTextSystem {
             &font_runs,
             force_width,
         );
-
-        self.font_runs_pool.lock().push(font_runs);
+        *self.font_runs.borrow_mut() = font_runs;
 
         layout
     }
@@ -945,7 +943,6 @@ impl WindowTextSystem {
     pub fn em_layout_width(&self, font_id: FontId, font_size: Pixels) -> Pixels {
         self.layout_width(font_id, font_size, 'm')
     }
-
 }
 
 #[derive(Hash, Eq, PartialEq)]

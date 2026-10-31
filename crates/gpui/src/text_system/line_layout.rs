@@ -1,9 +1,9 @@
 use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
 use collections::FxHashMap;
-use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
+    cell::{Cell, RefCell},
     hash::{Hash, Hasher},
     ops::Range,
     sync::{
@@ -456,13 +456,13 @@ impl WrappedLineLayout {
 }
 
 pub(crate) struct LineLayoutCache {
-    previous_frame: Mutex<FrameCache>,
-    current_frame: RwLock<FrameCache>,
+    previous_frame: RefCell<FrameCache>,
+    current_frame: RefCell<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
     /// Advances when [`TextSystem::add_fonts`] successfully changes the font database.
     font_generation: Arc<AtomicUsize>,
     /// Records the generation represented by both frame caches.
-    cached_font_generation: AtomicUsize,
+    cached_font_generation: Cell<usize>,
 }
 
 #[derive(Default)]
@@ -489,17 +489,17 @@ impl LineLayoutCache {
     ) -> Self {
         let cached_font_generation = font_generation.load(Ordering::Acquire);
         Self {
-            previous_frame: Mutex::default(),
-            current_frame: RwLock::default(),
+            previous_frame: RefCell::default(),
+            current_frame: RefCell::default(),
             platform_text_system,
             font_generation,
-            cached_font_generation: AtomicUsize::new(cached_font_generation),
+            cached_font_generation: Cell::new(cached_font_generation),
         }
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
         let font_generation = self.clear_if_font_generation_changed();
-        let frame = self.current_frame.read();
+        let frame = self.current_frame.borrow();
         LineLayoutIndex {
             font_generation,
             lines_index: frame.used_lines.len(),
@@ -514,8 +514,8 @@ impl LineLayoutCache {
         {
             return;
         }
-        let mut current_frame = &mut *self.current_frame.write();
-        let mut previous_frame = &mut *self.previous_frame.lock();
+        let current_frame = &mut *self.current_frame.borrow_mut();
+        let previous_frame = &mut *self.previous_frame.borrow_mut();
 
         for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
             if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
@@ -532,7 +532,6 @@ impl LineLayoutCache {
             }
             current_frame.used_wrapped_lines.push(key.clone());
         }
-
     }
 
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {
@@ -540,7 +539,7 @@ impl LineLayoutCache {
         if index.font_generation != font_generation {
             return;
         }
-        let mut current_frame = &mut *self.current_frame.write();
+        let mut current_frame = self.current_frame.borrow_mut();
         current_frame.used_lines.truncate(index.lines_index);
         current_frame
             .used_wrapped_lines
@@ -549,8 +548,8 @@ impl LineLayoutCache {
 
     pub fn finish_frame(&self) {
         let _font_generation = self.clear_if_font_generation_changed();
-        let mut curr_frame = self.current_frame.write();
-        let mut prev_frame = self.previous_frame.lock();
+        let mut curr_frame = self.current_frame.borrow_mut();
+        let mut prev_frame = self.previous_frame.borrow_mut();
         std::mem::swap(&mut *prev_frame, &mut *curr_frame);
         let demand = curr_frame
             .lines
@@ -609,21 +608,21 @@ impl LineLayoutCache {
             force_width: None,
         } as &dyn AsCacheKeyRef;
 
-        let current_frame = self.current_frame.upgradable_read();
+        let current_frame = self.current_frame.borrow();
         if let Some(layout) = current_frame.wrapped_lines.get(key) {
             return layout.clone();
         }
 
-        let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
+        let previous_frame_entry = self.previous_frame.borrow_mut().wrapped_lines.remove_entry(key);
+        drop(current_frame);
         if let Some((key, layout)) = previous_frame_entry {
-            let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
+            let mut current_frame = self.current_frame.borrow_mut();
             current_frame
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
             current_frame.used_wrapped_lines.push(key);
             layout
         } else {
-            drop(current_frame);
             let text = SharedString::from(text);
             let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
@@ -644,7 +643,7 @@ impl LineLayoutCache {
                 force_width: None,
             });
 
-            let mut current_frame = self.current_frame.write();
+            let mut current_frame = self.current_frame.borrow_mut();
             current_frame
                 .wrapped_lines
                 .insert(key.clone(), layout.clone());
@@ -674,13 +673,15 @@ impl LineLayoutCache {
             force_width,
         } as &dyn AsCacheKeyRef;
 
-        let current_frame = self.current_frame.upgradable_read();
+        let current_frame = self.current_frame.borrow();
         if let Some(layout) = current_frame.lines.get(key) {
             return layout.clone();
         }
 
-        let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
-        if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
+        drop(current_frame);
+        let previous_frame_entry = self.previous_frame.borrow_mut().lines.remove_entry(key);
+        if let Some((key, layout)) = previous_frame_entry {
+            let mut current_frame = self.current_frame.borrow_mut();
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
@@ -702,28 +703,22 @@ impl LineLayoutCache {
                 force_width,
             });
             let layout = Arc::new(layout);
+            let mut current_frame = self.current_frame.borrow_mut();
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
         }
     }
 
-
     fn clear_if_font_generation_changed(&self) -> usize {
         let font_generation = self.font_generation.load(Ordering::Acquire);
-        if self.cached_font_generation.load(Ordering::Acquire) == font_generation {
+        if self.cached_font_generation.get() == font_generation {
             return font_generation;
         }
 
-        let mut current_frame = self.current_frame.write();
-        if self.cached_font_generation.load(Ordering::Acquire) == font_generation {
-            return font_generation;
-        }
-
-        *current_frame = FrameCache::default();
-        *self.previous_frame.lock() = FrameCache::default();
-        self.cached_font_generation
-            .store(font_generation, Ordering::Release);
+        *self.current_frame.borrow_mut() = FrameCache::default();
+        *self.previous_frame.borrow_mut() = FrameCache::default();
+        self.cached_font_generation.set(font_generation);
         font_generation
     }
 }
@@ -794,7 +789,6 @@ impl PartialEq for dyn AsCacheKeyRef + '_ {
     }
 }
 
-
 impl Eq for dyn AsCacheKeyRef + '_ {}
 
 impl Hash for dyn AsCacheKeyRef + '_ {
@@ -845,6 +839,34 @@ mod tests {
     use crate::GlyphId;
 
     #[test]
+    fn cold_wrapped_layout_replays_and_invalidates_after_font_changes() {
+        let generation = Arc::new(AtomicUsize::new(0));
+        let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem), generation.clone());
+        let start = cache.layout_index();
+        let wrapped = cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
+        let end = cache.layout_index();
+        assert_eq!(wrapped.len(), "cold wrapped miss".len());
+        cache.finish_frame();
+        cache.reuse_layouts(start.clone()..end.clone());
+        let replayed = cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
+        assert!(Arc::ptr_eq(&wrapped, &replayed));
+        cache.truncate_layouts(start.clone());
+        assert_eq!(cache.layout_index().wrapped_lines_index, start.wrapped_lines_index);
+        generation.fetch_add(1, Ordering::Release);
+        cache.reuse_layouts(start.clone()..end);
+        cache.truncate_layouts(start);
+        let fresh = cache.layout_wrapped_line("cold wrapped miss", px(16.), &[], Some(px(40.)), None);
+        assert!(!Arc::ptr_eq(&wrapped, &fresh));
+        assert!(!Arc::ptr_eq(&wrapped.unwrapped_layout, &fresh.unwrapped_layout));
+        cache.finish_frame();
+        cache.finish_frame();
+        assert!(cache.previous_frame.borrow().lines.is_empty());
+        assert!(cache.previous_frame.borrow().wrapped_lines.is_empty());
+        assert!(cache.current_frame.borrow().used_lines.is_empty());
+        assert!(cache.current_frame.borrow().used_wrapped_lines.is_empty());
+    }
+
+    #[test]
     fn layout_replay_survives_discarded_cache_capacity_reclaim() {
         let cache = LineLayoutCache::new(
             Arc::new(crate::NoopTextSystem),
@@ -856,8 +878,8 @@ mod tests {
             }
             cache.finish_frame();
         }
-        assert!(cache.current_frame.read().lines.capacity() > 1024);
-        assert!(cache.previous_frame.lock().lines.capacity() > 1024);
+        assert!(cache.current_frame.borrow().lines.capacity() > 1024);
+        assert!(cache.previous_frame.borrow().lines.capacity() > 1024);
 
         let start = cache.layout_index();
         let retained = cache.layout_line("still painted", px(16.), &[], None);
@@ -871,10 +893,10 @@ mod tests {
             assert_eq!(layout.runs[0].glyphs.len(), "still painted".len());
             cache.finish_frame();
         }
-        assert!(cache.current_frame.read().lines.capacity() <= 1024);
-        assert!(cache.previous_frame.lock().lines.capacity() <= 1024);
-        assert!(cache.current_frame.read().used_lines.capacity() <= 256);
-        assert!(cache.previous_frame.lock().used_lines.capacity() <= 256);
+        assert!(cache.current_frame.borrow().lines.capacity() <= 1024);
+        assert!(cache.previous_frame.borrow().lines.capacity() <= 1024);
+        assert!(cache.current_frame.borrow().used_lines.capacity() <= 256);
+        assert!(cache.previous_frame.borrow().used_lines.capacity() <= 256);
 
         let fresh = cache.layout_line("after reclaim", px(16.), &[], None);
         assert_eq!(fresh.len, "after reclaim".len());
