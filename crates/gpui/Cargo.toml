@@ -212,7 +212,7 @@
 "rev" = "df48a139ce9c292738b523252c12f044697e673f"
 
 ["dependencies"."taffy"]
-"version" = "=0.13.0"
+"version" = "=0.15.0"
 "default-features" = false
 "features" = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "float_layout", "content_size"]
 
