@@ -1248,6 +1248,19 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     return blend_color(input.color, alpha_corrected);
 }
 
+// Cached subpixel glyphs replayed into an isolated transparent group need one
+// scalar coverage value, not dual-source blending against an opaque backdrop.
+@fragment
+fn fs_isolated_subpixel_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
+    let coverage = textureSample(t_sprite, s_sprite, input.tile_position).rgb;
+    let sample = dot(coverage, vec3<f32>(1.0 / 3.0));
+    let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+    if any(input.clip_distances < vec4<f32>(0.0)) {
+        return vec4<f32>(0.0);
+    }
+    return blend_color(input.color, alpha_corrected);
+}
+
 // --- polychrome sprites --- //
 
 struct ImageEffects {

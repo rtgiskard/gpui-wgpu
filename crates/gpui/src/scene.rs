@@ -39,12 +39,42 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+/// Per-window admission limits for optional scene-filter targets.
+/// Exceeding these limits omits filters, not the ordinary scene content.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneFilterLimits {
+    /// Maximum nominal bytes of the current filter target set, not total GPU memory.
+    pub max_target_bytes: u64,
+    /// Maximum simultaneous isolated groups, bounded by `Self::MAX_DEPTH`.
+    pub max_depth: usize,
+}
+
+impl SceneFilterLimits {
+    /// Hard implementation limit for isolated filter groups.
+    pub const MAX_DEPTH: usize = 4;
+}
+
+impl Default for SceneFilterLimits {
+    fn default() -> Self {
+        Self {
+            max_target_bytes: 128 * 1024 * 1024,
+            max_depth: Self::MAX_DEPTH,
+        }
+    }
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    // Filters are painter-order barriers: after the first one, geometry cannot
+    // be reordered across a capture or an isolated child group.
+    filter_order: Option<DrawOrder>,
+    max_order: DrawOrder,
+    filters: Vec<(DrawOrder, SceneFilter)>,
+    cg_water: Vec<(DrawOrder, crate::CgWaterDraw)>,
     low_demand_frames: u16,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
@@ -54,6 +84,8 @@ pub struct Scene {
     /// Preserved when scene contents are cleared or replayed.
     pub gpu_material_budget: Option<u64>,
     pub(crate) gpu_maintenance: RefCell<Option<Rc<dyn Fn(bool) -> bool>>>,
+    /// Window-owned filter admission policy, preserved across clear and cached replay.
+    pub scene_filter_limits: SceneFilterLimits,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
@@ -99,6 +131,10 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.filters.clear();
+        self.cg_water.clear();
+        self.filter_order = None;
+        self.max_order = 0;
         self.paths.clear();
         self.gpu_draws.clear();
         self.shadows.clear();
@@ -120,6 +156,8 @@ impl Scene {
             trim!(
                 paint_operations,
                 layer_stack,
+                filters,
+                cg_water,
                 paths,
                 gpu_draws,
                 shadows,
@@ -163,6 +201,37 @@ impl Scene {
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
+    /// Whether ordered filters or procedural water require effect preparation.
+    pub fn has_scene_effects(&self) -> bool {
+        !self.filters.is_empty() || !self.cg_water.is_empty()
+    }
+
+    /// Water panels in the same painter order as `batches`, without visiting other primitives.
+    pub fn cg_water_draws(&self) -> impl ExactSizeIterator<Item = &crate::CgWaterDraw> {
+        self.cg_water.iter().map(|(_, draw)| draw)
+    }
+
+    /// Insert a painter-order capture/isolation barrier.
+    pub fn insert_filter(&mut self, filter: SceneFilter) {
+        let order = self.max_order.checked_add(1).expect("scene order overflow");
+        self.max_order = order;
+        self.filter_order = Some(order);
+        self.filters.push((order, filter));
+        self.paint_operations.push(PaintOperation::Filter(filter));
+    }
+
+    /// Insert an opaque procedural water panel at this painter-order position.
+    pub fn insert_cg_water(&mut self, draw: crate::CgWaterDraw) {
+        if draw.bounds.intersect(&draw.clip).is_empty() {
+            return;
+        }
+        let order = self.max_order.checked_add(1).expect("scene order overflow");
+        self.max_order = order;
+        self.filter_order = Some(order);
+        self.cg_water.push((order, draw));
+        self.paint_operations.push(PaintOperation::CgWater(draw));
+    }
+
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let bounds = match &primitive {
@@ -180,11 +249,17 @@ impl Scene {
             return;
         }
 
-        let order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        let order = if let Some(previous) = self.filter_order {
+            let order = previous.checked_add(1).expect("scene order overflow");
+            self.filter_order = Some(order);
+            order
+        } else {
+            self.layer_stack
+                .last()
+                .copied()
+                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
+        };
+        self.max_order = self.max_order.max(order);
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -237,6 +312,8 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::Filter(filter) => self.insert_filter(*filter),
+                PaintOperation::CgWater(draw) => self.insert_cg_water(*draw),
                 PaintOperation::DetachedGpu => {
                     self.paint_operations.push(PaintOperation::DetachedGpu)
                 }
@@ -268,6 +345,8 @@ impl Scene {
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         BatchIterator {
+            filters_iter: self.filters.iter().peekable(),
+            cg_water_iter: self.cg_water.iter().peekable(),
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
@@ -312,14 +391,45 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    Filter,
+    CgWater,
 }
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    Filter(SceneFilter),
+    CgWater(crate::CgWaterDraw),
     // Retains cached paint-range indices across a hidden-window detach.
     DetachedGpu,
+}
+
+/// Ordered renderer operations. Bounds and widths are physical pixels.
+#[derive(Clone, Copy, Debug)]
+pub enum SceneFilter {
+    /// Blur the scene painted so far, within `clip` only.
+    BackdropBlur {
+        /// Panel bounds before clipping.
+        bounds: Bounds<ScaledPixels>,
+        /// Inherited content clipping.
+        clip: Bounds<ScaledPixels>,
+        /// Gaussian standard deviation, at most 32 physical pixels.
+        sigma: f32,
+        /// Accumulated element opacity used to mix the blur with the original backdrop.
+        opacity: f32,
+    },
+    /// Begin a transparent isolated child group.
+    BeginEdgeFade {
+        /// Unclipped group bounds used to evaluate the edge mask.
+        bounds: Bounds<ScaledPixels>,
+        /// Inherited content clipping.
+        clip: Bounds<ScaledPixels>,
+        /// Top/bottom fade width in physical pixels.
+        width: f32,
+    },
+    /// Composite the isolated child group with a single alpha mask.
+    EndEdgeFade,
 }
 
 #[derive(Clone)]
@@ -378,6 +488,8 @@ impl Primitive {
     allow(dead_code)
 )]
 struct BatchIterator<'a> {
+    filters_iter: Peekable<slice::Iter<'a, (DrawOrder, SceneFilter)>>,
+    cg_water_iter: Peekable<slice::Iter<'a, (DrawOrder, crate::CgWaterDraw)>>,
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
@@ -405,6 +517,11 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            (self.filters_iter.peek().map(|f| f.0), PrimitiveKind::Filter),
+            (
+                self.cg_water_iter.peek().map(|f| f.0),
+                PrimitiveKind::CgWater,
+            ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -448,6 +565,13 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            PrimitiveKind::CgWater => Some(PrimitiveBatch::CgWater(
+                self.cg_water_iter.next().unwrap().1,
+            )),
+            PrimitiveKind::Filter => {
+                let (_, filter) = self.filters_iter.next().unwrap();
+                Some(PrimitiveBatch::Filter(*filter))
+            }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -610,6 +734,10 @@ impl<'a> Iterator for BatchIterator<'a> {
 )]
 #[allow(missing_docs)]
 pub enum PrimitiveBatch {
+    /// A painter-order scene capture/compositing barrier.
+    Filter(SceneFilter),
+    /// Fixed procedural water, with no scene sampling.
+    CgWater(crate::CgWaterDraw),
     Shadows(Range<usize>),
     Quads(Range<usize>),
     Paths(Range<usize>),
@@ -636,6 +764,8 @@ impl PrimitiveBatch {
     #[expect(missing_docs)]
     pub fn label(&self) -> String {
         match self {
+            Self::Filter(filter) => format!("scene filter {filter:?}"),
+            Self::CgWater(_) => "CG water".into(),
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),

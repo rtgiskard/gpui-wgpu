@@ -769,6 +769,14 @@ pub trait InteractiveElement: Sized {
     /// Retrieve the interactivity state associated with this element
     fn interactivity(&mut self) -> &mut Interactivity;
 
+    /// Blur the already-painted scene beneath this panel, before its own
+    /// background and children. Requires the WGPU renderer. The sigma is in
+    /// logical pixels, capped at 32 physical pixels after display scaling.
+    fn backdrop_blur(mut self, sigma: Pixels) -> Self {
+        self.interactivity().backdrop_blur = Some(sigma);
+        self
+    }
+
     /// Assign this element to a group of elements that can be styled together
     fn group(mut self, group: impl Into<SharedString>) -> Self {
         self.interactivity().group = Some(group.into());
@@ -1836,6 +1844,14 @@ pub struct Div {
 }
 
 impl Div {
+    /// Isolate all children and fade their composed alpha at the top/bottom
+    /// edges. Text and icons overlap normally before the mask is applied.
+    /// Layout, clipping and hit testing are unchanged. Requires WGPU.
+    pub fn group_edge_fade(mut self, width: Pixels) -> Self {
+        self.interactivity.group_edge_fade = Some(width);
+        self
+    }
+
     /// Add a listener to be called when the children of this `Div` are prepainted.
     /// This allows you to store the [`Bounds`] of the children for later use.
     pub fn on_children_prepainted(
@@ -2041,6 +2057,7 @@ impl Element for Div {
             scroll_handle.scroll_to_active_item();
         }
 
+        let group_edge_fade = self.interactivity.group_edge_fade;
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2055,19 +2072,21 @@ impl Element for Div {
                 }
 
                 window.with_image_cache(image_cache, |window| {
-                    window.with_element_offset(scroll_offset, |window| {
-                        if let Some(order_fn) = &self.prepaint_order_fn {
-                            let order = order_fn(window, cx);
-                            for idx in order {
-                                if let Some(child) = self.children.get_mut(idx) {
+                    window.prepaint_group_edge_fade(bounds, group_edge_fade, |window| {
+                        window.with_element_offset(scroll_offset, |window| {
+                            if let Some(order_fn) = &self.prepaint_order_fn {
+                                let order = order_fn(window, cx);
+                                for idx in order {
+                                    if let Some(child) = self.children.get_mut(idx) {
+                                        child.prepaint(window, cx);
+                                    }
+                                }
+                            } else {
+                                for child in &mut self.children {
                                     child.prepaint(window, cx);
                                 }
                             }
-                        } else {
-                            for child in &mut self.children {
-                                child.prepaint(window, cx);
-                            }
-                        }
+                        });
                     });
 
                     if let Some(listener) = self.prepaint_listener.as_ref() {
@@ -2096,6 +2115,7 @@ impl Element for Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
+        let group_edge_fade = self.interactivity.group_edge_fade;
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
@@ -2110,9 +2130,11 @@ impl Element for Div {
                         return;
                     }
 
-                    for child in &mut self.children {
-                        child.paint(window, cx);
-                    }
+                    window.with_group_edge_fade(bounds, group_edge_fade, |window| {
+                        for child in &mut self.children {
+                            child.paint(window, cx);
+                        }
+                    });
                 },
             )
         });
@@ -2156,6 +2178,8 @@ pub(crate) struct AriaProperties {
 /// interactivity in the `Div` element.
 #[derive(Default)]
 pub struct Interactivity {
+    pub(crate) backdrop_blur: Option<Pixels>,
+    pub(crate) group_edge_fade: Option<Pixels>,
     /// The element ID of the element. In id is required to support a stateful subset of the interactivity such as on_click.
     pub element_id: Option<ElementId>,
     /// Whether the element was clicked. This will only be present after layout.
@@ -2572,6 +2596,11 @@ impl Interactivity {
                 }
 
                 window.with_element_opacity(style.opacity, |window| {
+                    if style.display != Display::None {
+                        if let Some(sigma) = self.backdrop_blur {
+                            window.paint_backdrop_blur(bounds, sigma);
+                        }
+                    }
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(
@@ -4492,6 +4521,46 @@ mod tests {
         MouseMoveEvent, TestAppContext, TouchEvent, TouchId, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
+
+    #[gpui::test]
+    fn fully_clipped_fades_preserve_paint_bookkeeping_without_filter_operations(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_empty_window();
+        let painted = Rc::new(Cell::new(0));
+        let observed = painted.clone();
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    window.with_content_mask(Some(crate::ContentMask { bounds }), |window| {
+                        let outside =
+                            Bounds::new(point(px(200.), px(200.)), size(px(10.), px(10.)));
+                        for _ in 0..33 {
+                            window.with_group_edge_fade(outside, Some(px(4.)), |window| {
+                                observed.set(observed.get() + 1);
+                                window.paint_quad(crate::fill(bounds, crate::red()));
+                            });
+                        }
+                        window.paint_quad(crate::fill(bounds, crate::blue()));
+                    });
+                },
+            )
+            .size_full()
+            .into_any_element()
+        });
+        assert_eq!(painted.get(), 33);
+        window.update(|window, _| {
+            assert!(
+                !window
+                    .rendered_frame
+                    .scene
+                    .batches()
+                    .any(|batch| { matches!(batch, crate::PrimitiveBatch::Filter(_)) })
+            );
+            assert_eq!(window.rendered_frame.scene.quads.len(), 1);
+        });
+    }
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,

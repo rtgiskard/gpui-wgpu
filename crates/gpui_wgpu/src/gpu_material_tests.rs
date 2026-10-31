@@ -97,6 +97,115 @@ fn pixel(image: &image::RgbaImage, x: u32, y: u32, expected: [u8; 4]) {
     );
 }
 
+fn still_water_image(
+    renderer: &mut WgpuHeadlessRenderer,
+    phase: f32,
+    light_mode: bool,
+    viewport: Size<DevicePixels>,
+) -> anyhow::Result<image::RgbaImage> {
+    let area = bounds(0.0, 0.0, viewport.width.0 as f32, viewport.height.0 as f32);
+    let mut scene = Scene::default();
+    scene.insert_cg_water(gpui::CgWaterDraw {
+        bounds: area,
+        clip: area,
+        opacity: 1.0,
+        params: gpui::CgWaterParams {
+            phase,
+            amplitude: 0.8,
+            highlight: 0.8,
+            light_mode,
+            style: gpui::CgWaterStyle::Still,
+        },
+    });
+    scene.finish();
+    renderer.render_scene_to_image(&scene, viewport)
+}
+
+#[test]
+fn still_water_animation_changes_pixels_nonuniformly() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    for light_mode in [false, true] {
+        let mut previous = still_water_image(&mut renderer, 0.13, light_mode, size(128, 96))?;
+        for phase in [0.37, 0.73] {
+            let current = still_water_image(&mut renderer, phase, light_mode, size(128, 96))?;
+            let mut changed = 0;
+            let mut minimum = [i16::MAX; 3];
+            let mut maximum = [i16::MIN; 3];
+            for (a, b) in previous.pixels().zip(current.pixels()) {
+                if (0..3).any(|channel| a[channel].abs_diff(b[channel]) > 3) {
+                    changed += 1;
+                }
+                for channel in 0..3 {
+                    let delta = i16::from(b[channel]) - i16::from(a[channel]);
+                    minimum[channel] = minimum[channel].min(delta);
+                    maximum[channel] = maximum[channel].max(delta);
+                }
+            }
+            assert!(
+                changed > current.width() * current.height() / 100,
+                "animation must visibly change more than isolated pixels: changed={changed}, phase={phase}, light_mode={light_mode}"
+            );
+            // A global brightness pulse is temporal, but is not water motion.
+            // Require spatially different signed RGB changes above readback
+            // quantization noise, not a snapshot of one shader composition.
+            assert!(
+                (0..3).any(|channel| maximum[channel] - minimum[channel] > 6),
+                "animation changes must vary spatially: min={minimum:?}, max={maximum:?}, phase={phase}, light_mode={light_mode}"
+            );
+            previous = current;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn still_water_rainfall_evolves_continuously_between_nearby_frames() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    // Resolve individual ripple trains rather than letting footprint filtering
+    // turn their motion into a subpixel brightness change.
+    let viewport = size(640, 400);
+    let frame_step = 1.0 / 240.0;
+    for light_mode in [false, true] {
+        for sample in 0..12 {
+            let phase = sample as f32 / 12.0;
+            let first = still_water_image(&mut renderer, phase, light_mode, viewport)?;
+            let nearby = still_water_image(
+                &mut renderer,
+                phase + frame_step / 128.0,
+                light_mode,
+                viewport,
+            )?;
+            let next = still_water_image(&mut renderer, phase + frame_step, light_mode, viewport)?;
+            let mut largest_nearby_change = 0;
+            let mut evolving_pixels = 0;
+            for ((first, nearby), next) in first.pixels().zip(nearby.pixels()).zip(next.pixels()) {
+                let mut visibly_evolving = false;
+                for channel in 0..3 {
+                    largest_nearby_change =
+                        largest_nearby_change.max(first[channel].abs_diff(nearby[channel]));
+                    visibly_evolving |= first[channel].abs_diff(next[channel]) > 3;
+                }
+                evolving_pixels += u32::from(visibly_evolving);
+            }
+            // Coarse phase comparisons can pass an animation that holds still
+            // and replaces its ripples intermittently. Require resolved motion
+            // throughout the cycle, including both day and night palettes.
+            assert!(
+                evolving_pixels >= first.width() * first.height() / 1000,
+                "rainfall must keep evolving at nearby phases: pixels={evolving_pixels}, phase={phase}, light_mode={light_mode}"
+            );
+            // Unlike the endpoint checks, these samples cover the interior of
+            // the animation cycle. Tiny time advances must not teleport fronts
+            // or flash pixels as impact slots change their event parameters.
+            assert!(
+                largest_nearby_change <= 4,
+                "rainfall must evolve continuously: largest_change={largest_nearby_change}, phase={phase}, light_mode={light_mode}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn drain_material_maintenance(scene: &Scene, discard: bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while scene.maintain_gpu_resources(discard) {
@@ -2761,7 +2870,7 @@ fn alpha_transitions_preserve_mixed_pixels_uploads_and_scratch_recovery() -> any
     // Model that resource boundary without claiming a native surface was tested.
     let before_release = renderer.read_image()?;
     let (attachments, uploads, palettes) = retained.unwrap();
-    renderer.core.resources.invalidate_intermediate_textures();
+    renderer.core.resources.invalidate_surface_targets();
     assert_eq!(renderer.msaa_attachment_stats(), (None, attachments.1));
     renderer
         .core
@@ -2776,5 +2885,409 @@ fn alpha_transitions_preserve_mixed_pixels_uploads_and_scratch_recovery() -> any
         renderer.core.resources.materials.borrow().palette_stats().1,
         palettes
     );
+    Ok(())
+}
+
+#[test]
+fn cg_water_shader_validates_and_controls_are_finite() {
+    let module =
+        naga::front::wgsl::parse_str(include_str!("cg_water.wgsl")).expect("water WGSL parses");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .expect("water requires no optional shader capabilities");
+    let p = gpui::CgWaterParams {
+        phase: f32::NAN,
+        amplitude: f32::INFINITY,
+        highlight: -1.,
+        light_mode: false,
+        style: gpui::CgWaterStyle::Still,
+    }
+    .normalized();
+    assert_eq!((p.phase, p.amplitude, p.highlight), (0., 0., 0.));
+    assert_eq!(p.style, gpui::CgWaterStyle::Still);
+}
+
+#[test]
+fn cg_water_phase_static_clip_order_and_replay() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    let make_scene = |phase, amplitude| {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., 64., 64.), gpui::blue()));
+        scene.insert_cg_water(gpui::CgWaterDraw {
+            bounds: bounds(0., 0., 64., 64.),
+            clip: bounds(8., 4., 48., 56.),
+            opacity: 1.,
+            params: gpui::CgWaterParams {
+                phase,
+                amplitude,
+                highlight: 0.8,
+                light_mode: true,
+                style: gpui::CgWaterStyle::Perspective,
+            },
+        });
+        scene.insert_primitive(quad(bounds(24., 24., 16., 16.), gpui::red()));
+        scene.finish();
+        scene
+    };
+    let zero = make_scene(0., 0.8);
+    let first = renderer.render_scene_to_image(&zero, size(64, 64))?;
+    let repeat = renderer.render_scene_to_image(&zero, size(64, 64))?;
+    assert_eq!(
+        first, repeat,
+        "static rendering must not contain a hidden clock"
+    );
+    let closed = renderer.render_scene_to_image(&make_scene(1., 0.8), size(64, 64))?;
+    assert_eq!(first, closed, "phase endpoints close exactly");
+    let moving = renderer.render_scene_to_image(&make_scene(0.23, 0.8), size(64, 64))?;
+    assert_ne!(first, moving, "analytic normals must respond to phase");
+    let flat_zero = renderer.render_scene_to_image(&make_scene(0., 0.), size(64, 64))?;
+    let flat_later = renderer.render_scene_to_image(&make_scene(0.23, 0.), size(64, 64))?;
+    assert_eq!(
+        flat_zero, flat_later,
+        "zero amplitude is finite and motionless"
+    );
+    pixel(&first, 2, 32, BLUE);
+    pixel(&first, 60, 32, BLUE);
+    pixel(&first, 12, 2, BLUE);
+    pixel(&first, 32, 32, RED);
+    assert_ne!(first.get_pixel(12, 48).0, BLUE);
+    let mut replay = Scene::default();
+    replay.replay(0..zero.len(), &zero);
+    replay.finish();
+    assert_eq!(
+        first,
+        renderer.render_scene_to_image(&replay, size(64, 64))?
+    );
+    replay.clear();
+    replay.insert_primitive(quad(bounds(0., 0., 64., 64.), gpui::blue()));
+    replay.finish();
+    let plain = renderer.render_scene_to_image(&replay, size(64, 64))?;
+    assert!(plain.pixels().all(|pixel| pixel.0 == BLUE));
+    assert!(renderer.core.resources.cg_water.is_some());
+    assert!(renderer.core.resources.scene_filters.is_none());
+    replay.clear();
+    replay.replay(0..zero.len(), &zero);
+    replay.finish();
+    assert_eq!(
+        first,
+        renderer.render_scene_to_image(&replay, size(64, 64))?,
+        "water reactivation after clear changed cached pixels"
+    );
+    Ok(())
+}
+
+#[test]
+fn cg_water_premultiplied_opacity_and_lazy_resources() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    assert!(renderer.core.resources.cg_water.is_none());
+    assert!(renderer.core.resources.scene_filters.is_none());
+    let mut scene = Scene::default();
+    scene.insert_cg_water(gpui::CgWaterDraw {
+        bounds: bounds(0., 0., 32., 32.),
+        clip: bounds(0., 0., 32., 32.),
+        opacity: 0.5,
+        params: gpui::CgWaterParams {
+            phase: 0.,
+            amplitude: 0.,
+            highlight: 0.,
+            light_mode: false,
+            style: gpui::CgWaterStyle::Perspective,
+        },
+    });
+    scene.finish();
+    let image = renderer.render_scene_to_image(&scene, size(32, 32))?;
+    assert!(renderer.core.resources.cg_water.is_some());
+    assert!(renderer.core.resources.scene_filters.is_none());
+    // Headless rendering clears to opaque black. Half-opacity premultiplied
+    // output must remain opaque after source-over and darker than full water.
+    let px = image.get_pixel(16, 24).0;
+    let mut full = Scene::default();
+    full.insert_cg_water(gpui::CgWaterDraw {
+        bounds: bounds(0., 0., 32., 32.),
+        clip: bounds(0., 0., 32., 32.),
+        opacity: 1.,
+        params: gpui::CgWaterParams {
+            phase: 0.,
+            amplitude: 0.,
+            highlight: 0.,
+            light_mode: false,
+            style: gpui::CgWaterStyle::Perspective,
+        },
+    });
+    full.finish();
+    let opaque = renderer.render_scene_to_image(&full, size(32, 32))?;
+    let reference = opaque.get_pixel(16, 24).0;
+    assert_eq!(px[3], 255);
+    for (half, full) in px[..3].iter().zip(reference) {
+        assert!(half.abs_diff((f32::from(full) * 0.5).round() as u8) <= 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn cg_water_panel_limit_preserves_content_and_recovers_pixels() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    let make_scene = |count: usize| {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., 32., 32.), gpui::blue()));
+        for index in 0..count {
+            scene.insert_cg_water(gpui::CgWaterDraw {
+                bounds: bounds(0., 0., 32., 32.),
+                clip: bounds(0., 0., 32., 32.),
+                // Only the last panel contributes, exercising the final uniform slot.
+                opacity: if index + 1 == count { 1. } else { 0. },
+                params: gpui::CgWaterParams {
+                    phase: 0.,
+                    amplitude: 0.,
+                    highlight: 0.,
+                    light_mode: false,
+                    style: gpui::CgWaterStyle::Perspective,
+                },
+            });
+        }
+        scene.finish();
+        scene
+    };
+    let invalid = make_scene(257);
+    let mut mixed_invalid = Scene::default();
+    mixed_invalid.replay(0..invalid.len(), &invalid);
+    mixed_invalid.insert_filter(gpui::SceneFilter::EndEdgeFade);
+    mixed_invalid.finish();
+    assert!(
+        renderer
+            .render_scene(&mixed_invalid, size(32, 32))
+            .unwrap_err()
+            .to_string()
+            .contains("unmatched scene filter group end"),
+        "water admission must not hide the existing filter error"
+    );
+    let ordinary = renderer.render_scene_to_image(&make_scene(0), size(32, 32))?;
+    assert_eq!(
+        renderer.render_scene_to_image(&invalid, size(32, 32))?,
+        ordinary,
+        "over-limit water must preserve ordinary content"
+    );
+    assert!(renderer.core.resources.cg_water.is_none());
+    assert!(renderer.core.resources.scene_filters.is_none());
+    let reference = renderer.render_scene_to_image(&make_scene(1), size(32, 32))?;
+    assert_eq!(
+        renderer.render_scene_to_image(&make_scene(256), size(32, 32))?,
+        reference,
+        "the final legal water uniform slot was not rendered"
+    );
+    assert_eq!(
+        renderer.render_scene_to_image(&invalid, size(32, 32))?,
+        ordinary
+    );
+    assert_eq!(
+        renderer.render_scene_to_image(&make_scene(1), size(32, 32))?,
+        reference,
+        "skipped water frame poisoned the next frame"
+    );
+    assert!(renderer.core.resources.scene_filters.is_none());
+    Ok(())
+}
+
+#[test]
+fn calm_water_motion_static_periodicity_and_palettes() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    let make_scene = |phase, amplitude, light_mode| {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds(0., 0., 128., 96.), gpui::blue()));
+        scene.insert_cg_water(gpui::CgWaterDraw {
+            bounds: bounds(0., 0., 128., 96.),
+            clip: bounds(8., 4., 112., 88.),
+            opacity: 1.,
+            params: gpui::CgWaterParams {
+                phase,
+                amplitude,
+                highlight: 0.8,
+                light_mode,
+                style: gpui::CgWaterStyle::Still,
+            },
+        });
+        scene.insert_primitive(quad(bounds(56., 40., 16., 16.), gpui::red()));
+        scene.finish();
+        scene
+    };
+    let mut dark = None;
+    for light_mode in [false, true] {
+        let scene = make_scene(0., 0.8, light_mode);
+        let first = renderer.render_scene_to_image(&scene, size(128, 96))?;
+        assert_eq!(
+            first,
+            renderer.render_scene_to_image(&scene, size(128, 96))?,
+            "calm water has no hidden clock"
+        );
+        assert_eq!(
+            first,
+            renderer.render_scene_to_image(&make_scene(1., 0.8, light_mode), size(128, 96))?,
+            "calm phase endpoints close exactly"
+        );
+        let moving =
+            renderer.render_scene_to_image(&make_scene(0.25, 0.8, light_mode), size(128, 96))?;
+        assert_ne!(first, moving, "calm ripple packets respond to phase");
+        assert_eq!(
+            moving,
+            renderer.render_scene_to_image(&make_scene(1.25, 0.8, light_mode), size(128, 96))?,
+            "calm water is periodic beyond the first cycle"
+        );
+        let flat =
+            renderer.render_scene_to_image(&make_scene(0., 0., light_mode), size(128, 96))?;
+        for phase in [0.25, 0.63, 1.] {
+            assert_eq!(
+                flat,
+                renderer
+                    .render_scene_to_image(&make_scene(phase, 0., light_mode), size(128, 96))?,
+                "zero calm amplitude is phase-independent"
+            );
+        }
+        // Each packet wraps at a different phase. Compare both sides of every
+        // boundary, not just normalized phase zero, to catch a visible reset.
+        for boundary in [0., 0.29, 0.63] {
+            let before = renderer.render_scene_to_image(
+                &make_scene(boundary - 0.00001, 0.8, light_mode),
+                size(128, 96),
+            )?;
+            let after = renderer.render_scene_to_image(
+                &make_scene(boundary + 0.00001, 0.8, light_mode),
+                size(128, 96),
+            )?;
+            assert!(
+                before
+                    .as_raw()
+                    .iter()
+                    .zip(after.as_raw())
+                    .all(|(a, b)| a.abs_diff(*b) <= 1),
+                "calm ripple birth and death must not pop"
+            );
+        }
+        pixel(&first, 2, 48, BLUE);
+        pixel(&first, 124, 48, BLUE);
+        pixel(&first, 64, 2, BLUE);
+        pixel(&first, 64, 48, RED);
+        assert_ne!(first.get_pixel(24, 72).0, BLUE);
+        let mut replay = Scene::default();
+        replay.replay(0..scene.len(), &scene);
+        replay.finish();
+        assert_eq!(
+            first,
+            renderer.render_scene_to_image(&replay, size(128, 96))?,
+            "retained calm scenes preserve the selected mode"
+        );
+        if let Some(dark) = dark.as_ref() {
+            assert_ne!(&first, dark, "calm light and dark palettes differ");
+        } else {
+            dark = Some(first);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn calm_water_remains_visible_through_panel_tint() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    let render_scene = |amplitude| {
+        let mut scene = Scene::default();
+        let placement = bounds(0., 0., 640., 400.);
+        scene.insert_cg_water(gpui::CgWaterDraw {
+            bounds: placement,
+            clip: placement,
+            opacity: 1.,
+            params: gpui::CgWaterParams {
+                phase: 0.25,
+                amplitude,
+                highlight: 0.32,
+                light_mode: false,
+                style: gpui::CgWaterStyle::Still,
+            },
+        });
+        let mut tint: gpui::Hsla = gpui::rgb(0x12141a).into();
+        tint.a = 0.72;
+        scene.insert_primitive(quad(placement, tint));
+        scene.finish();
+        scene
+    };
+    let flat = renderer.render_scene_to_image(&render_scene(0.), size(640, 400))?;
+    let ripples = renderer.render_scene_to_image(&render_scene(0.25), size(640, 400))?;
+    // A nonzero sub-byte change is not enough: the default wave must survive
+    // the panel tint with a visible local contrast, not just a few bright pixels.
+    let visible_pixels = flat
+        .pixels()
+        .zip(ripples.pixels())
+        .filter(|(a, b)| {
+            a.0[..3]
+                .iter()
+                .zip(&b.0[..3])
+                .any(|(a, b)| a.abs_diff(*b) >= 10)
+        })
+        .count();
+    assert!(
+        visible_pixels >= 512,
+        "default ripple contrast lost under tint: {visible_pixels}"
+    );
+    Ok(())
+}
+
+#[test]
+fn procedural_styles_preserve_static_phase_and_distinct_motion() -> anyhow::Result<()> {
+    let mut renderer = WgpuHeadlessRenderer::new()?;
+    let styles = [
+        gpui::CgWaterStyle::Stream,
+        gpui::CgWaterStyle::Lake,
+        gpui::CgWaterStyle::Rain,
+        gpui::CgWaterStyle::Garden,
+        gpui::CgWaterStyle::Crystal,
+    ];
+    let scene = |style, phase, amplitude, light_mode| {
+        let mut scene = Scene::default();
+        scene.insert_cg_water(gpui::CgWaterDraw {
+            bounds: bounds(0., 0., 128., 96.),
+            clip: bounds(0., 0., 128., 96.),
+            opacity: 1.,
+            params: gpui::CgWaterParams {
+                phase,
+                amplitude,
+                highlight: 0.5,
+                light_mode,
+                style,
+            },
+        });
+        scene.insert_primitive(quad(bounds(56., 40., 16., 16.), gpui::red()));
+        scene.finish();
+        scene
+    };
+    for light in [false, true] {
+        let mut previous = None;
+        for style in styles {
+            let first =
+                renderer.render_scene_to_image(&scene(style, 0., 0.4, light), size(128, 96))?;
+            let moved =
+                renderer.render_scene_to_image(&scene(style, 0.25, 0.4, light), size(128, 96))?;
+            assert_ne!(first, moved, "{style:?} must animate its own field");
+            pixel(&moved, 64, 48, RED);
+            assert_eq!(
+                first,
+                renderer.render_scene_to_image(&scene(style, 1., 0.4, light), size(128, 96))?
+            );
+            let flat =
+                renderer.render_scene_to_image(&scene(style, 0., 0., light), size(128, 96))?;
+            assert_eq!(
+                flat,
+                renderer.render_scene_to_image(&scene(style, 0.37, 0., light), size(128, 96))?,
+                "zero amplitude must stop every source of motion"
+            );
+            if let Some(previous) = previous {
+                assert_ne!(
+                    first, previous,
+                    "new styles must not alias the preceding shader"
+                );
+            }
+            previous = Some(first);
+        }
+    }
     Ok(())
 }

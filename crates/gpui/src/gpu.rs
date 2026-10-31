@@ -16,6 +16,78 @@ use std::sync::{
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PALETTE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Fixed shader variants; each retains the same bounded placement resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CgWaterStyle {
+    /// Perspective sky reflection and rolling analytic wave normals.
+    Perspective,
+    /// Shallow water, refraction and sparse radial ripples.
+    Still,
+    /// Directional shallow-bed flow and elongated caustics.
+    Stream,
+    /// Quiet distant reflection with horizontal wind ripples.
+    Lake,
+    /// Sparse rain impacts on shallow overcast water.
+    Rain,
+    /// Soft moving leaf shadows over a refracting water bed.
+    Garden,
+    /// Nearly colorless refracting sheets with broad curved light.
+    Crystal,
+}
+
+/// Fixed procedural water. The caller owns repaint scheduling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CgWaterParams {
+    /// Periodic animation cycle; zero and one render identically.
+    pub phase: f32,
+    /// Wave or ripple strength, clamped to the finite unit interval.
+    pub amplitude: f32,
+    /// Reflection strength, clamped to the finite unit interval.
+    pub highlight: f32,
+    /// Daylight rather than moonlit procedural sky.
+    pub light_mode: bool,
+    /// Procedural composition, independent of artwork and theme colors.
+    pub style: CgWaterStyle,
+}
+
+impl CgWaterParams {
+    /// Normalize untrusted numerical inputs without introducing an animation clock.
+    pub fn normalized(self) -> Self {
+        fn unit(v: f32) -> f32 {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
+        Self {
+            phase: if self.phase.is_finite() {
+                self.phase.rem_euclid(1.0)
+            } else {
+                0.0
+            },
+            amplitude: unit(self.amplitude),
+            highlight: unit(self.highlight),
+            light_mode: self.light_mode,
+            style: self.style,
+        }
+    }
+}
+
+/// Renderer-facing, constant-size procedural water placement; no texture publication.
+#[derive(Clone, Copy, Debug)]
+pub struct CgWaterDraw {
+    /// Unclipped physical placement.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Inherited physical content clipping.
+    pub clip: Bounds<ScaledPixels>,
+    /// Normalized procedural controls.
+    pub params: CgWaterParams,
+    /// Inherited element opacity; output uses premultiplied alpha.
+    pub opacity: f32,
+}
+
 fn next_id(counter: &AtomicU64) -> Result<u64> {
     counter
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

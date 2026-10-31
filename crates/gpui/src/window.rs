@@ -1119,7 +1119,7 @@ pub(crate) struct PrepaintStateIndex {
 /// The inherited group state that can change descendant painting, but not hit testing.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct GroupPaintContext {
-    hidden: bool,
+    pub(crate) hidden: bool,
     isolated: bool,
 }
 
@@ -1342,6 +1342,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    isolated_paint_depth: usize,
     pub(crate) group_paint_context: GroupPaintContext,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -2254,6 +2255,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            isolated_paint_depth: 0,
             group_paint_context: GroupPaintContext::default(),
             requested_autoscroll: None,
             last_text_input_configuration: None,
@@ -3496,7 +3498,13 @@ impl Window {
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            // Covering a fractional empty interval would turn it into a pixel.
+            // Keep empty clips empty while retaining cover semantics for visible clips.
+            bounds: if self.content_mask().bounds.is_empty() {
+                self.content_mask().bounds.scale(self.scale_factor())
+            } else {
+                self.cover_bounds(self.content_mask().bounds)
+            },
         }
     }
 
@@ -4258,10 +4266,12 @@ impl Window {
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-        );
+        if !self.group_paint_context.hidden {
+            self.next_frame.scene.replay(
+                range.start.scene_index..range.end.scene_index,
+                &self.rendered_frame.scene,
+            );
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -4710,6 +4720,128 @@ impl Window {
         result
     }
 
+    /// Paint fixed analytic water without sampling the scene or scheduling animation.
+    /// Native Metal backends are unsupported and fail explicitly.
+    pub fn paint_cg_water(&mut self, bounds: Bounds<Pixels>, params: crate::CgWaterParams) {
+        self.invalidator.debug_assert_paint();
+        assert!(
+            !cfg!(any(target_os = "macos", target_os = "ios")),
+            "CG water requires the WGPU renderer"
+        );
+        let clip = bounds.intersect(&self.content_mask().bounds);
+        if clip.is_empty() || self.element_opacity() <= 0.0 {
+            return;
+        }
+        let scale = self.scale_factor();
+        self.next_frame.scene.insert_cg_water(crate::CgWaterDraw {
+            bounds: bounds.scale(scale),
+            clip: clip.scale(scale),
+            params: params.normalized(),
+            opacity: self.element_opacity(),
+        });
+    }
+
+    /// Capture and blur already-painted pixels beneath a local panel. This is
+    /// a WGPU scene operation, not an image effect or a background overlay.
+    pub fn paint_backdrop_blur(&mut self, bounds: Bounds<Pixels>, sigma: Pixels) {
+        self.invalidator.debug_assert_paint();
+        if !sigma.0.is_finite() || sigma.0 <= 0.0 || self.element_opacity() <= 0.0 {
+            return;
+        }
+        assert!(
+            !cfg!(any(target_os = "macos", target_os = "ios")),
+            "backdrop_blur requires the WGPU renderer"
+        );
+        let clip = bounds.intersect(&self.content_mask().bounds);
+        if !clip.is_empty() {
+            let scale = self.scale_factor();
+            self.next_frame
+                .scene
+                .insert_filter(crate::SceneFilter::BackdropBlur {
+                    bounds: bounds.scale(scale),
+                    clip: clip.scale(scale),
+                    sigma: (sigma.0 * scale).min(32.0),
+                    opacity: self.element_opacity(),
+                });
+        }
+    }
+
+    /// Predict the matching [`Self::with_group_edge_fade`] scope during prepaint
+    /// so cached descendants can reuse layout and paint under a stable group context.
+    /// This does not clip layout or input hitboxes.
+    pub fn prepaint_group_edge_fade<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        width: Option<Pixels>,
+        prepaint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+        self.with_group_paint_context(bounds, width, prepaint)
+    }
+
+    fn with_group_paint_context<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        width: Option<Pixels>,
+        prepaint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.group_paint_context;
+        if width.is_some_and(|width| width.0.is_finite() && width.0 > 0.0) {
+            if bounds.intersect(&self.content_mask().bounds).is_empty() {
+                self.group_paint_context.hidden = true;
+            } else if !previous.hidden {
+                self.group_paint_context.isolated = true;
+            }
+        }
+        let result = prepaint(self);
+        self.group_paint_context = previous;
+        result
+    }
+
+    /// Paint children to one transparent group, then apply a vertical alpha
+    /// mask once. Input and layout are deliberately outside this paint scope.
+    /// Pair with [`Self::prepaint_group_edge_fade`] to retain cached descendant reuse.
+    pub fn with_group_edge_fade<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        width: Option<Pixels>,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        self.with_group_paint_context(bounds, width, |window| {
+            let Some(width) = width.filter(|w| w.0.is_finite() && w.0 > 0.0) else {
+                return paint(window);
+            };
+            let clip = bounds.intersect(&window.content_mask().bounds);
+            if clip.is_empty() {
+                // Visit children for paint bookkeeping, without letting overflowing
+                // child content escape a group that would composite no pixels.
+                return window.with_content_mask(Some(ContentMask { bounds: clip }), paint);
+            }
+            assert!(
+                !cfg!(any(target_os = "macos", target_os = "ios")),
+                "group_edge_fade requires the WGPU renderer"
+            );
+            let scale = window.scale_factor();
+            window
+                .next_frame
+                .scene
+                .insert_filter(crate::SceneFilter::BeginEdgeFade {
+                    bounds: bounds.scale(scale),
+                    clip: clip.scale(scale),
+                    width: width.0.min(bounds.size.height.0 * 0.5) * scale,
+                });
+            window.isolated_paint_depth += 1;
+            let result = paint(window);
+            window.isolated_paint_depth -= 1;
+            window
+                .next_frame
+                .scene
+                .insert_filter(crate::SceneFilter::EndEdgeFade);
+            result
+        })
+    }
+
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.
@@ -4936,6 +5068,24 @@ impl Window {
         Ok(())
     }
 
+    /// Set optional scene-filter limits for both frame scenes without changing content.
+    /// Over-limit frames render without scene filters; later frames are admitted anew.
+    pub fn set_scene_filter_limits(&mut self, bytes: u64, max_depth: usize) -> Result<()> {
+        anyhow::ensure!(bytes > 0, "Scene filter texture budget must be positive");
+        anyhow::ensure!(
+            (1..=crate::SceneFilterLimits::MAX_DEPTH).contains(&max_depth),
+            "Scene filter depth must be between 1 and {}",
+            crate::SceneFilterLimits::MAX_DEPTH
+        );
+        let limits = crate::SceneFilterLimits {
+            max_target_bytes: bytes,
+            max_depth,
+        };
+        self.next_frame.scene.scene_filter_limits = limits;
+        self.rendered_frame.scene.scene_filter_limits = limits;
+        Ok(())
+    }
+
     /// Record a bounded GPU publication at the current z-index.
     ///
     /// Bounds, clipping and inherited opacity are captured independently of the
@@ -5092,6 +5242,11 @@ impl Window {
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+        // Dual-source subpixel coverage assumes an opaque destination. Request
+        // actual grayscale glyph rasterization for transparent child groups.
+        if self.isolated_paint_depth != 0 {
+            return false;
+        }
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
@@ -5169,6 +5324,10 @@ impl Window {
                 opacity,
                 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                 transformation: TransformationMatrix::unit(),
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                source_tile_bounds: tile.bounds,
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                effects: crate::ImageEffects::default(),
             });
         }
         Ok(())
@@ -5280,6 +5439,38 @@ impl Window {
         grayscale: bool,
         transformation: Option<Transformation>,
     ) -> Result<()> {
+        self.paint_image_with_effects(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            transformation,
+            crate::ImageEffects::default(),
+        )
+    }
+
+    /// Paint a cached source image with composable GPU-only sampling effects.
+    ///
+    /// Effects do not affect layout, content masks or the transformation pivot.
+    /// Nondefault effects are explicitly rejected on native Metal backends.
+    pub fn paint_image_with_effects(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        transformation: Option<Transformation>,
+        effects: crate::ImageEffects,
+    ) -> Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        anyhow::ensure!(
+            effects == crate::ImageEffects::default(),
+            "source-image effects require a WGPU backend"
+        );
         self.invalidator.debug_assert_paint();
 
         let visible_bounds = bounds.intersect(&image_bounds);
@@ -5337,31 +5528,23 @@ impl Window {
             let width_ratio = visible_bounds.size.width / image_bounds.size.width;
             let height_ratio = visible_bounds.size.height / image_bounds.size.height;
 
-            let tile_origin_x = tile.bounds.origin.x.0;
-            let tile_origin_y = tile.bounds.origin.y.0;
-            let tile_width = tile.bounds.size.width.0;
-            let tile_height = tile.bounds.size.height.0;
-
-            let sub_origin_x = tile_origin_x + (x_offset_ratio * tile_width as f32).round() as i32;
-            let sub_origin_y = tile_origin_y + (y_offset_ratio * tile_height as f32).round() as i32;
-            let sub_width = (width_ratio * tile_width as f32).round() as i32;
-            let sub_height = (height_ratio * tile_height as f32).round() as i32;
-
-            let max_x = tile_origin_x + tile_width;
-            let max_y = tile_origin_y + tile_height;
-
-            let clamped_origin_x = sub_origin_x.clamp(tile_origin_x, max_x);
-            let clamped_origin_y = sub_origin_y.clamp(tile_origin_y, max_y);
-            let clamped_width = sub_width.min(max_x - clamped_origin_x).max(0);
-            let clamped_height = sub_height.min(max_y - clamped_origin_y).max(0);
+            let (origin_x, width) = Self::image_crop_axis(
+                tile.bounds.origin.x.0,
+                tile.bounds.size.width.0,
+                x_offset_ratio,
+                width_ratio,
+            );
+            let (origin_y, height) = Self::image_crop_axis(
+                tile.bounds.origin.y.0,
+                tile.bounds.size.height.0,
+                y_offset_ratio,
+                height_ratio,
+            );
 
             AtlasTile {
                 bounds: Bounds {
-                    origin: point(
-                        DevicePixels(clamped_origin_x),
-                        DevicePixels(clamped_origin_y),
-                    ),
-                    size: size(DevicePixels(clamped_width), DevicePixels(clamped_height)),
+                    origin: point(DevicePixels(origin_x), DevicePixels(origin_y)),
+                    size: size(DevicePixels(width), DevicePixels(height)),
                 },
                 ..tile
             }
@@ -5384,8 +5567,27 @@ impl Window {
             opacity,
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             transformation,
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            source_tile_bounds: tile.bounds,
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            effects: effects.scaled(self.scale_factor()),
         });
         Ok(())
+    }
+
+    fn image_crop_axis(
+        origin: i32,
+        length: i32,
+        offset_ratio: f32,
+        length_ratio: f32,
+    ) -> (i32, i32) {
+        // A positive visible crop always needs one source texel. Rounding its
+        // extent to zero (or its origin to the exclusive end) lets the shader's
+        // half-texel clamp escape this tile and read a neighboring allocation.
+        let end = origin + length;
+        let start = (origin + (offset_ratio * length as f32).round() as i32).clamp(origin, end - 1);
+        let length = (length_ratio * length as f32).round() as i32;
+        (start, length.clamp(1, end - start))
     }
 
     /// Paint a surface into the scene for the next frame at the current z-index.
@@ -8342,6 +8544,277 @@ mod tests {
                 );
             })
             .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn fractional_empty_content_masks_stay_empty_at_every_scale(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            window.update(|window, _| window.set_scale_factor(scale));
+            window.draw(point(px(0.), px(0.)), size(px(30.), px(30.)), |_, _| {
+                canvas(
+                    |_, _, _| (),
+                    |bounds, _, window, _| {
+                        for extent in [
+                            size(px(0.), px(10.)),
+                            size(px(10.), px(0.)),
+                            size(px(0.), px(0.)),
+                        ] {
+                            let mask = ContentMask {
+                                bounds: Bounds::new(point(px(0.3), px(0.7)), extent),
+                            };
+                            window.with_content_mask(Some(mask), |window| {
+                                assert!(window.snapped_content_mask().bounds.is_empty());
+                                window.paint_quad(crate::fill(bounds, crate::red()));
+                            });
+                            window.with_group_edge_fade(mask.bounds, Some(px(4.)), |window| {
+                                window.paint_quad(crate::fill(bounds, crate::red()));
+                            });
+                        }
+                        let raw = Bounds::new(point(px(0.3), px(0.7)), size(px(0.1), px(0.1)));
+                        window.with_content_mask(Some(ContentMask { bounds: raw }), |window| {
+                            let covered = window.snapped_content_mask().bounds;
+                            let scaled = raw.scale(window.scale_factor());
+                            assert!(!covered.is_empty());
+                            assert!(covered.left() <= scaled.left());
+                            assert!(covered.top() <= scaled.top());
+                            assert!(covered.right() >= scaled.right());
+                            assert!(covered.bottom() >= scaled.bottom());
+                        });
+                    },
+                )
+                .size_full()
+                .into_any_element()
+            });
+            window.update(|window, _| assert!(window.rendered_frame.scene.quads.is_empty()));
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[gpui::test]
+    fn low_level_group_clips_cached_children_and_restores_paint(cx: &mut TestAppContext) {
+        struct Child;
+        impl Render for Child {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .window_control_area(crate::WindowControlArea::Drag)
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            |bounds, _, window, _| {
+                                window.paint_quad(crate::fill(bounds, crate::red()));
+                                window.paint_backdrop_blur(bounds, px(2.));
+                            },
+                        )
+                        .size_full(),
+                    )
+            }
+        }
+        struct Root {
+            child: crate::Entity<Child>,
+            group_bounds: Bounds<Pixels>,
+            predicted_bounds: Option<Bounds<Pixels>>,
+        }
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let child = self.child.clone();
+                let group_bounds = self.group_bounds;
+                let predicted_bounds = self.predicted_bounds;
+                canvas(
+                    move |bounds, window, cx| {
+                        let mut child = child
+                            .cached(crate::StyleRefinement::default().size(px(20.)))
+                            .into_any_element();
+                        if let Some(predicted) = predicted_bounds {
+                            window.prepaint_group_edge_fade(predicted, Some(px(4.)), |window| {
+                                child.prepaint_as_root(
+                                    bounds.origin,
+                                    bounds.size.into(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        } else {
+                            child.prepaint_as_root(bounds.origin, bounds.size.into(), window, cx);
+                        }
+                        child
+                    },
+                    move |_, mut child, window, cx| {
+                        window.with_group_edge_fade(group_bounds, Some(px(4.)), |window| {
+                            child.paint(window, cx);
+                        });
+                    },
+                )
+                .size_full()
+            }
+        }
+        let visible = Bounds::new(point(px(0.), px(0.)), size(px(40.), px(40.)));
+        let empty = Bounds::new(point(px(0.), px(0.)), size(px(40.), px(0.)));
+        let outside = Bounds::new(point(px(-80.), px(-80.)), size(px(40.), px(40.)));
+        for initial in [visible, empty] {
+            let window = cx.add_window(|_, cx| Root {
+                child: cx.new(|_| Child),
+                group_bounds: initial,
+                predicted_bounds: None,
+            });
+            let initially_visible = initial.size.height > px(0.);
+            for (predicted_bounds, group_bounds, child_visible) in [
+                (None, initial, initially_visible),
+                (None, initial, initially_visible),
+                (None, empty, false),
+                (None, empty, false),
+                (None, visible, true),
+                (None, outside, false),
+                (None, visible, true),
+                (Some(empty), empty, false),
+                (Some(empty), empty, false),
+                // A hidden cache cannot paint visible content until the next prepaint.
+                (Some(empty), visible, false),
+                (Some(visible), visible, true),
+                (Some(visible), visible, true),
+            ] {
+                window
+                    .update(cx, |root, _, cx| {
+                        root.group_bounds = group_bounds;
+                        root.predicted_bounds = predicted_bounds;
+                        cx.notify();
+                    })
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    let visible =
+                        group_bounds.size.height > px(0.) && group_bounds.origin.x >= px(0.);
+                    assert_eq!(
+                        window.rendered_frame.scene.quads.len(),
+                        usize::from(child_visible)
+                    );
+                    let has_filters = window
+                        .rendered_frame
+                        .scene
+                        .batches()
+                        .any(|batch| matches!(batch, crate::PrimitiveBatch::Filter(_)));
+                    assert_eq!(has_filters, visible);
+                    assert!(!window.rendered_frame.window_control_hitboxes.is_empty());
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[gpui::test]
+    fn cached_children_follow_paint_only_group_visibility(cx: &mut TestAppContext) {
+        struct Child(Rc<Cell<usize>>);
+        impl Render for Child {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let painted = self.0.clone();
+                div()
+                    .size_full()
+                    .window_control_area(crate::WindowControlArea::Drag)
+                    .child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                painted.set(painted.get() + 1);
+                                window.with_group_edge_fade(bounds, Some(px(2.)), |window| {
+                                    window.paint_quad(crate::fill(bounds, crate::red()));
+                                    window.paint_backdrop_blur(bounds, px(2.));
+                                });
+                            },
+                        )
+                        .size_full(),
+                    )
+            }
+        }
+        struct Root {
+            child: crate::Entity<Child>,
+            height: Pixels,
+        }
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(40.))
+                        .h(self.height)
+                        .group_edge_fade(px(4.))
+                        .child(
+                            div()
+                                .absolute()
+                                .size(px(20.))
+                                .group_edge_fade(px(2.))
+                                .child(self.child.clone().cached(
+                                    crate::StyleRefinement::default().absolute().size(px(20.)),
+                                )),
+                        ),
+                )
+            }
+        }
+        for initially_visible in [true, false] {
+            let painted = Rc::new(Cell::new(0));
+            let window = cx.add_window({
+                let painted = painted.clone();
+                move |_, cx| Root {
+                    child: cx.new(|_| Child(painted)),
+                    height: if initially_visible { px(40.) } else { px(0.) },
+                }
+            });
+            let mut previous_paints = 0;
+            for (frame, visible) in [
+                initially_visible,
+                initially_visible,
+                !initially_visible,
+                initially_visible,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                window
+                    .update(cx, |root, _, cx| {
+                        root.height = if visible { px(40.) } else { px(0.) };
+                        cx.notify();
+                    })
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    assert_eq!(
+                        window.rendered_frame.scene.quads.len(),
+                        usize::from(visible)
+                    );
+                    let filters = window
+                        .rendered_frame
+                        .scene
+                        .batches()
+                        .filter(|batch| matches!(batch, crate::PrimitiveBatch::Filter(_)))
+                        .count();
+                    assert_eq!(filters > 0, visible);
+                    window.simulate_mouse_move(point(px(5.), px(5.)), cx);
+                    // Paint-only hiding must not remove the overflowing child's hitbox.
+                    assert!(window.rendered_frame.hitboxes.iter().any(|hitbox| {
+                        hitbox.bounds.contains(&point(px(5.), px(5.)))
+                            && window.mouse_hit_test.ids.contains(&hitbox.id)
+                    }));
+                })
+                .unwrap();
+                if frame == 1 {
+                    assert_eq!(
+                        painted.get(),
+                        previous_paints,
+                        "steady group state reuses paint"
+                    );
+                } else if frame > 1 {
+                    assert_eq!(
+                        painted.get(),
+                        previous_paints + 1,
+                        "transitions repaint children"
+                    );
+                }
+                previous_paints = painted.get();
+            }
         }
     }
 

@@ -635,10 +635,21 @@ fn paint_view(
                         element.paint(window, cx);
                         window.refreshing = refreshing;
                         element_state.cache_key.opacity = opacity;
+                        element_state.cache_key.group_paint_context = window.group_paint_context;
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());
-                        if element_state.cache_key.opacity.to_bits() != opacity.to_bits() {
+                        if element_state.cache_key.opacity.to_bits() != opacity.to_bits()
+                            || element_state.cache_key.group_paint_context
+                                != window.group_paint_context
+                        {
                             window.request_animation_frame();
+                        }
+                        // Suppressed replay is valid hidden paint. An empty hidden
+                        // range cannot be certified visible without painting it;
+                        // retain its context until the requested redraw rebuilds it.
+                        if window.group_paint_context.hidden {
+                            element_state.cache_key.group_paint_context =
+                                window.group_paint_context;
                         }
                     }
 

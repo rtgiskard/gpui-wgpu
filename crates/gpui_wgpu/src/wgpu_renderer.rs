@@ -1,3 +1,7 @@
+#[path = "cg_water.rs"]
+mod cg_water;
+#[path = "scene_filters.rs"]
+mod scene_filters;
 use crate::gpu_material::{MaterialRenderer, PreparedMaterials};
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
@@ -10,6 +14,7 @@ use gpui::{
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use scene_filters::{SceneFilters, ScenePreparation};
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
@@ -68,7 +73,10 @@ impl MsaaScratchCapacity {
             self.low_peak.0 = self.low_peak.0.max(demand.0);
             self.low_peak.1 = self.low_peak.1.max(demand.1);
             let excessive = |capacity: u32, used: u32| {
-                capacity > used.saturating_mul(2).max(used.saturating_add(MSAA_SCRATCH_MAX_SLACK))
+                capacity
+                    > used
+                        .saturating_mul(2)
+                        .max(used.saturating_add(MSAA_SCRATCH_MAX_SLACK))
             };
             let delay = if excessive(self.extent.0, self.low_peak.0)
                 || excessive(self.extent.1, self.low_peak.1)
@@ -229,6 +237,7 @@ struct WgpuPipelines {
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
+    isolated_subpixel_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
@@ -284,6 +293,8 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     materials: Rc<RefCell<MaterialRenderer>>,
     material_maintenance: Rc<dyn Fn(bool) -> bool>,
+    cg_water: Option<cg_water::CgWaterRenderer>,
+    scene_filters: Option<SceneFilters>,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
@@ -306,6 +317,13 @@ struct CachedTextureBindGroup {
 impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
         self.msaa_scratch = None;
+    }
+
+    fn invalidate_surface_targets(&mut self) {
+        self.invalidate_intermediate_textures();
+        if let Some(filters) = &mut self.scene_filters {
+            filters.retire_targets();
+        }
     }
 }
 
@@ -989,6 +1007,18 @@ impl WgpuRendererCore {
             1,
             &shader_module,
         );
+        let isolated_subpixel_sprites = create_pipeline(
+            "isolated_subpixel_sprites",
+            "vs_mono_sprite",
+            "fs_isolated_subpixel_sprite",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
 
         let subpixel_sprites = if let Some(subpixel_module) = &subpixel_shader_module {
             let subpixel_blend = wgpu::BlendState {
@@ -1057,6 +1087,7 @@ impl WgpuRendererCore {
             paths,
             underlines,
             mono_sprites,
+            isolated_subpixel_sprites,
             subpixel_sprites,
             poly_sprites,
             surfaces,
@@ -1154,7 +1185,7 @@ impl WgpuRenderer {
 
         // Release ownership, never explicitly destroy a submitted attachment.
         // The next frame plans current demand after the surface is healthy.
-        resources.invalidate_intermediate_textures();
+        resources.invalidate_surface_targets();
 
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
@@ -1258,7 +1289,7 @@ impl WgpuRenderer {
             if self.failed_frame_count > 10 {
                 panic!("Too many consecutive GPU errors. Last error: {error}");
             } else if self.failed_frame_count > 5 {
-                core.resources.invalidate_intermediate_textures();
+                core.resources.invalidate_surface_targets();
                 self.atlas.clear();
                 self.needs_redraw = true;
                 self.failed_frame_count = 0;
@@ -1469,6 +1500,8 @@ impl WgpuRendererCore {
             resources: WgpuResources {
                 materials,
                 material_maintenance,
+                scene_filters: None,
+                cg_water: None,
                 device,
                 queue,
                 pipelines,
@@ -1758,23 +1791,25 @@ impl WgpuRendererCore {
         size: Size<DevicePixels>,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
-        self.record_frame_inner(scene, frame_view, size, clear_color)
-            .inspect_err(|_| {
-                // Queue writes are staged before encoding; flush them even if the frame fails.
-                self.low_instance_data_frames = 0;
-                self.low_instance_data_peak = 0;
-                self.low_path_vertex_frames = 0;
-                self.low_path_vertex_peak = 0;
-                self.low_path_sprite_frames = 0;
-                self.low_path_sprite_peak = 0;
-                self.resources.invalidate_intermediate_textures();
-                self.release_frame_plan();
-                self.resources.queue.submit(std::iter::empty());
-                self.resources
-                    .materials
-                    .borrow_mut()
-                    .submitted(&self.resources.queue);
-            })
+        let mut filters = self.resources.scene_filters.take();
+        let result = self.record_frame_inner(scene, frame_view, size, clear_color, &mut filters);
+        self.resources.scene_filters = filters;
+        result.inspect_err(|_| {
+            // Queue writes are staged before encoding; flush them even if the frame fails.
+            self.low_instance_data_frames = 0;
+            self.low_instance_data_peak = 0;
+            self.low_path_vertex_frames = 0;
+            self.low_path_vertex_peak = 0;
+            self.low_path_sprite_frames = 0;
+            self.low_path_sprite_peak = 0;
+            self.resources.invalidate_surface_targets();
+            self.release_frame_plan();
+            self.resources.queue.submit(std::iter::empty());
+            self.resources
+                .materials
+                .borrow_mut()
+                .submitted(&self.resources.queue);
+        })
     }
 
     fn record_frame_inner(
@@ -1783,7 +1818,36 @@ impl WgpuRendererCore {
         frame_view: &wgpu::TextureView,
         size: Size<DevicePixels>,
         clear_color: wgpu::Color,
+        filters: &mut Option<SceneFilters>,
     ) -> Result<wgpu::SubmissionIndex> {
+        let preparation =
+            ScenePreparation::scan(scene, size, &self.resources.device, self.target_format)?;
+        if preparation.has_filters {
+            filters
+                .get_or_insert_with(|| {
+                    SceneFilters::new(&self.resources.device, self.target_format)
+                })
+                .prepare(&self.resources.device, &preparation, size);
+        } else if let Some(filters) = filters.as_mut() {
+            filters.retire_targets();
+        }
+        if preparation.has_water {
+            let water = self.resources.cg_water.get_or_insert_with(|| {
+                cg_water::CgWaterRenderer::new(&self.resources.device, self.target_format)
+            });
+            water.prepare(&self.resources.queue, scene, size)?;
+        }
+        let mut water_index = 0;
+        let mut current_view = if preparation.has_filters {
+            filters
+                .as_ref()
+                .expect("prepared scene filters")
+                .view(0, frame_view)
+        } else {
+            frame_view.clone()
+        };
+        let mut filter_stack: SmallVec<[(gpui::SceneFilter, bool); 4]> = SmallVec::new();
+        let mut filter_marker = 0;
         let frame_start_capacity = self.instance_data_capacity;
         let frame_start_path_capacity = self.path_vertices.capacity();
         self.path_vertex_peak = 0;
@@ -1882,7 +1946,7 @@ impl WgpuRendererCore {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
+                    view: &current_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear_color),
@@ -1897,6 +1961,83 @@ impl WgpuRendererCore {
             let mut native_raster_index = 0;
             for batch in scene.batches() {
                 match batch {
+                    PrimitiveBatch::CgWater(_) => {
+                        if !preparation.has_water {
+                            continue;
+                        }
+                        self.resources
+                            .cg_water
+                            .as_ref()
+                            .expect("prepared water renderer")
+                            .draw(&mut pass, water_index);
+                        water_index += 1;
+                    }
+                    PrimitiveBatch::Filter(filter) => {
+                        if !preparation.has_filters {
+                            continue;
+                        }
+                        let filters = filters.as_mut().expect("prepared scene filters");
+                        drop(pass);
+                        let mut load = wgpu::LoadOp::Load;
+                        let mut snapshot = false;
+                        match filter {
+                            gpui::SceneFilter::BeginEdgeFade { .. } => {
+                                snapshot = filters.requires_snapshot(filter_marker);
+                                filter_stack.push((filter, snapshot));
+                                current_view = filters.view(filter_stack.len(), frame_view);
+                                if !snapshot {
+                                    load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+                                }
+                            }
+                            gpui::SceneFilter::EndEdgeFade => {
+                                let depth = filter_stack.len();
+                                let (group, snapshot) =
+                                    filter_stack.pop().expect("preflight balances groups");
+                                filters.composite(
+                                    &mut encoder,
+                                    &self.resources.queue,
+                                    depth,
+                                    group,
+                                    snapshot,
+                                    frame_view,
+                                );
+                                current_view = filters.view(filter_stack.len(), frame_view);
+                            }
+                            gpui::SceneFilter::BackdropBlur {
+                                bounds,
+                                clip,
+                                sigma,
+                                opacity,
+                            } => {
+                                filters.blur(
+                                    &mut encoder,
+                                    &self.resources.queue,
+                                    filter_stack.len(),
+                                    bounds,
+                                    clip,
+                                    sigma,
+                                    opacity,
+                                );
+                            }
+                        }
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main pass after scene filter"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &current_view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            ..Default::default()
+                        });
+                        if snapshot {
+                            filters.snapshot(&self.resources.queue, filter_stack.len(), &mut pass);
+                        }
+                        filter_marker += 1;
+                    }
                     #[cfg(not(target_os = "macos"))]
                     PrimitiveBatch::Gpu(range) => {
                         let mut indices = range.peekable();
@@ -1913,7 +2054,7 @@ impl WgpuRendererCore {
                                 pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                     label: Some("main_pass_after_msaa"),
                                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: frame_view,
+                                        view: &current_view,
                                         resolve_target: None,
                                         ops: wgpu::Operations {
                                             load: wgpu::LoadOp::Load,
@@ -1940,19 +2081,13 @@ impl WgpuRendererCore {
                         }
                     }
                     PrimitiveBatch::Quads(range) => self.draw_instances(
-                        instance_bindings
-                            .quads
-                            .as_ref()
-                            .expect("quad batch has instances"),
+                        &instance_bindings.quads,
                         &self.resources().pipelines.quads,
                         instance_range(range),
                         &mut pass,
                     ),
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
-                        instance_bindings
-                            .shadows
-                            .as_ref()
-                            .expect("shadow batch has instances"),
+                        &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,
                         instance_range(range),
                         &mut pass,
@@ -1982,7 +2117,7 @@ impl WgpuRendererCore {
                         pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("main_pass_continued"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: frame_view,
+                                view: &current_view,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Load,
@@ -2002,20 +2137,14 @@ impl WgpuRendererCore {
                         )?;
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
-                        instance_bindings
-                            .underlines
-                            .as_ref()
-                            .expect("underline batch has instances"),
+                        &instance_bindings.underlines,
                         &self.resources().pipelines.underlines,
                         instance_range(range),
                         &mut pass,
                     ),
                     PrimitiveBatch::MonochromeSprites { texture_id, range } => {
                         self.draw_sprites(
-                            instance_bindings
-                                .monochrome_sprites
-                                .as_ref()
-                                .expect("monochrome batch has instances"),
+                            &instance_bindings.monochrome_sprites,
                             texture_id,
                             &self.resources().pipelines.mono_sprites,
                             instance_range(range),
@@ -2025,26 +2154,24 @@ impl WgpuRendererCore {
                     PrimitiveBatch::SubpixelSprites { texture_id, range } => {
                         let resources = self.resources();
                         self.draw_sprites(
-                            instance_bindings
-                                .subpixel_sprites
-                                .as_ref()
-                                .expect("subpixel batch has instances"),
+                            &instance_bindings.subpixel_sprites,
                             texture_id,
-                            resources
-                                .pipelines
-                                .subpixel_sprites
-                                .as_ref()
-                                .unwrap_or(&resources.pipelines.mono_sprites),
+                            if !filter_stack.is_empty() {
+                                &resources.pipelines.isolated_subpixel_sprites
+                            } else {
+                                resources
+                                    .pipelines
+                                    .subpixel_sprites
+                                    .as_ref()
+                                    .unwrap_or(&resources.pipelines.mono_sprites)
+                            },
                             instance_range(range),
                             &mut pass,
                         )?;
                     }
                     PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                         self.draw_sprites(
-                            instance_bindings
-                                .polychrome_sprites
-                                .as_ref()
-                                .expect("polychrome batch has instances"),
+                            &instance_bindings.polychrome_sprites,
                             texture_id,
                             &self.resources().pipelines.poly_sprites,
                             instance_range(range),
@@ -2056,6 +2183,9 @@ impl WgpuRendererCore {
                     PrimitiveBatch::Surfaces(_surfaces) => {}
                 }
             }
+        }
+        if let Some(filters) = filters.as_mut().filter(|_| preparation.has_filters) {
+            filters.present(&mut encoder, &self.resources.queue, frame_view);
         }
 
         let submission = self
@@ -2806,7 +2936,7 @@ impl WgpuRenderer {
         };
         // Drop intermediate textures since they reference the old surface size.
         if let Some(core) = self.core_mut() {
-            core.resources.invalidate_intermediate_textures();
+            core.resources.invalidate_surface_targets();
             core.path_vertices = Vec::new();
             core.path_vertex_peak = 0;
             core.low_path_vertex_frames = 0;
@@ -2874,7 +3004,7 @@ impl WgpuRenderer {
             core.update_alpha_mode(alpha_mode);
         }
         surface.configure(&core.resources.device, &self.surface_config);
-        core.resources.invalidate_intermediate_textures();
+        core.resources.invalidate_surface_targets();
         self.state = RendererState::Ready { surface, core };
 
         Ok(())
@@ -2938,11 +3068,8 @@ impl WgpuRenderer {
             // may need more time to come back (e.g. after suspend/resume).
             std::thread::sleep(std::time::Duration::from_millis(350));
 
-            let (new_context, surface) = WgpuContext::for_window_rejecting_software(
-                window,
-                &config,
-                self.compositor_gpu,
-            )?;
+            let (new_context, surface) =
+                WgpuContext::for_window_rejecting_software(window, &config, self.compositor_gpu)?;
             *gpu_context.borrow_mut() = Some(new_context);
             surface
         } else {
@@ -4234,6 +4361,41 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_translucent_paths_use_source_over_alpha_not_addition() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let bounds = solid_quad(0., 0., 64., 64., gpui::white()).bounds;
+        let mut scene = Scene::default();
+        scene.insert_filter(gpui::SceneFilter::BeginEdgeFade {
+            bounds,
+            clip: bounds,
+            width: 16.,
+        });
+        for color in [gpui::red(), gpui::blue()] {
+            let mut path = rectangle_path(0., 0., 64., 64.);
+            path.color = gpui::Background::from(color).opacity(0.5);
+            scene.insert_primitive(path);
+        }
+        scene.insert_filter(gpui::SceneFilter::EndEdgeFade);
+        scene.finish();
+        let size = device_size(64, 64);
+        renderer.ensure_render_target(size)?;
+        let view = renderer.render_target.as_ref().unwrap().view.clone();
+        renderer
+            .core
+            .render_frame(&scene, &view, size, false, wgpu::Color::TRANSPARENT)?;
+        let image = renderer.read_image()?;
+        assert_pixel(&image, 32, 32, [64, 0, 128, 192]);
+        let edge = image.get_pixel(32, 8).0;
+        assert!(edge[3] > 0 && edge[3] < 192);
+        assert!(
+            edge[0] <= edge[3] && edge[2] <= edge[3],
+            "non-premultiplied edge: {edge:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_no_path_intermediates(renderer: &WgpuHeadlessRenderer) {
         assert!(renderer.core.resources.msaa_scratch.is_none());
     }
@@ -4458,6 +4620,56 @@ mod tests {
                 renderer.render_scene_no_readback(&Scene::default(), size)?;
                 assert!(renderer.core.resources.atlas_texture_bind_groups.is_empty());
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn water_uniform_slots_match_independent_panels_after_replay_and_clear() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let size = device_size(96, 32);
+        let panels = std::array::from_fn::<_, 3, _>(|index| {
+            let bounds = solid_quad(index as f32 * 32.0, 0.0, 32.0, 24.0, gpui::red()).bounds;
+            gpui::CgWaterDraw {
+                bounds,
+                clip: bounds,
+                opacity: 1.0,
+                params: gpui::CgWaterParams {
+                    phase: index as f32 * 0.23,
+                    amplitude: 0.8,
+                    highlight: 0.8,
+                    light_mode: index % 2 == 0,
+                    style: gpui::CgWaterStyle::Perspective,
+                },
+            }
+        });
+        let mut references = Vec::new();
+        let mut combined = Scene::default();
+        for panel in panels {
+            let mut single = Scene::default();
+            single.insert_cg_water(panel);
+            single.finish();
+            references.push(renderer.render_scene_to_image(&single, size)?);
+            combined.insert_cg_water(panel);
+            // Interspersed non-water batches must not consume a uniform slot.
+            combined.insert_primitive(solid_quad(0.0, 28.0, 96.0, 4.0, gpui::red()));
+        }
+        combined.finish();
+        let mut replay = Scene::default();
+        replay.replay(0..combined.len(), &combined);
+        replay.finish();
+        for scene in [&combined, &replay] {
+            renderer.render_scene_no_readback(&Scene::default(), size)?;
+            let image = renderer.render_scene_to_image(scene, size)?;
+            for (index, reference) in references.iter().enumerate() {
+                for y in 0..24 {
+                    for x in index as u32 * 32..(index as u32 + 1) * 32 {
+                        assert_eq!(image.get_pixel(x, y), reference.get_pixel(x, y));
+                    }
+                }
+            }
+            assert_pixel(&image, 8, 30, RED);
         }
         Ok(())
     }
@@ -4753,6 +4965,14 @@ mod tests {
         validate_wgsl(
             SUBPIXEL_SHADERS,
             naga::valid::Capabilities::DUAL_SOURCE_BLENDING,
+        );
+    }
+
+    #[test]
+    fn scene_filter_shader_is_valid_wgsl() {
+        validate_wgsl(
+            include_str!("scene_filters.wgsl"),
+            naga::valid::Capabilities::empty(),
         );
     }
 
