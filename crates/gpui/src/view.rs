@@ -323,6 +323,7 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    opacity: f32,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -526,11 +527,14 @@ fn prepaint_view(
             |element_state, window| {
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
+                let opacity = window.element_opacity();
 
+                // Compare bits so NaN opacity still matches itself and reuses the cache.
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
+                    && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
                 {
@@ -566,6 +570,7 @@ fn prepaint_view(
                             bounds,
                             content_mask,
                             text_style,
+                            opacity,
                         },
                     },
                 )
@@ -605,13 +610,22 @@ fn paint_view(
                     let mut element_state = element_state.unwrap();
 
                     let paint_start = window.paint_index();
+                    let opacity = window.element_opacity();
 
+                    // Prepaint can only predict paint's opacity: ancestor hover and
+                    // drag-over styles depend on this frame's completed hit test.
+                    // Record the opacity actually painted; replay under a different
+                    // opacity is redrawn on the next frame.
                     if let Some(element) = element {
                         let refreshing = mem::replace(&mut window.refreshing, true);
                         element.paint(window, cx);
                         window.refreshing = refreshing;
+                        element_state.cache_key.opacity = opacity;
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());
+                        if element_state.cache_key.opacity.to_bits() != opacity.to_bits() {
+                            window.request_animation_frame();
+                        }
                     }
 
                     let paint_end = window.paint_index();
