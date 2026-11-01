@@ -28,6 +28,32 @@ validated together at the final tree; individual intermediate commits are not
 claimed to build independently. Rivu's application changes, integration tests and
 benchmark claims are not imported. No application dependency cutover is included.
 
+The glass-materials branch adds composable source-image effects, bounded ordered
+scene filters and procedural water, with image/cache and resource-lifetime fixes.
+Their migration commits name the original Rivu source; application material state,
+artwork demand, controls and configuration remain in Rivu. These extensions build
+on the maintained text, renderer and Taffy updates rather than replacing them.
+
+Still Water is a calm field of localized raindrop impacts. Sixteen bounded event
+slots produce 32 unevenly timed arrivals per wrapping phase cycle; each epoch
+changes an impact's position, strength and scale. Complete circular wavefronts
+are mildly foreshortened into perspective ellipses. A compact expanding packet
+contains up to four oscillations, with cylindrical spreading and lifetime damping
+leaving quiet gaps rather than broad swell blobs. Analytic heights and gradients
+overlap before a single normal drives shallow-bed refraction and broad sky
+reflection: rings are surface motion, not luminous overlays or painted streaks.
+Smooth birth/death envelopes and silent epoch margins keep the phase C1 across
+every replacement and wrap; zero amplitude is static. Highlight controls reflected
+light and subtle procedural caustics. Pixel-footprint attenuation suppresses
+unresolved carriers before they reach the normal.
+
+The field has a fixed 16-slot loop with no nested sampling. Its per-fragment upper
+bound is 16 arithmetic hashes, 16 square roots, 16 inverse square roots and 16
+sine/cosine pairs; inactive, unresolved and spatially excluded packets return
+early. There are no finite-difference normal samples, textures, additional
+buffers, render passes or CPU event storage. The other six water styles retain
+their independent shading.
+
 ## Layout and responsibilities
 
 - `crates/gpui`: drawing APIs, scene recording/replay, UI and text state
@@ -103,9 +129,9 @@ Build outputs default to `.cache/target`. Both crates intentionally retain
 separate regression workspaces; there is no root Cargo workspace. Their lockfiles
 are committed.
 
-The imported sources have existing rustfmt differences. `make lint` reports
-those differences before reaching Clippy; this extraction intentionally does not
-mix formatting cleanup into the provenance-preserving patch history.
+`make lint` checks formatting for both standalone crate roots, then runs Clippy
+with all targets and features. Clippy may emit warnings; a successful command is
+not a warning-free result.
 
 For focused checks:
 
