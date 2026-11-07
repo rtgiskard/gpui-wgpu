@@ -64,6 +64,20 @@ Unmodified platform and support crates still come from the pinned Zed revision.
 Keep both patched crates on the same commit and review Rust/shader layouts,
 composition order and resource lifetimes together when updating upstream.
 
+Window-local atlas removal invalidates lookup immediately; the frame-discard
+boundary releases storage only after the sole replayable scene no longer uses it.
+Sprite ABI stays unchanged. A hidden/no-draw window may retain removed tiles until
+its scene is discarded, the atlas is reset, or the window is destroyed.
+
+Atlas pixels go directly to WGPU staging without changing CPU image format or
+alpha semantics. Deleting an image cannot cancel that staged upload, so a valid
+device must advance pending uploads even when presentation is skipped or the
+surface is detached. Repeated skips without new uploads do not keep submitting.
+Device loss hands the old queue to recovery; submitted commands retain their resources.
+
+WebGL bindings belong to each texture allocation; rollover must preserve earlier
+draws rather than overwrite or release their storage.
+
 ## Upstream tracking
 
 Support and platform crates remain pinned to the baseline above. Backport selected

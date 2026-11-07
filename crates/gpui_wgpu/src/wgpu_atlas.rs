@@ -22,20 +22,14 @@ fn etagere_point_to_device(point: etagere::Point) -> Point<DevicePixels> {
 
 pub struct WgpuAtlas(Mutex<AtlasState<WgpuAtlasTextures>>);
 
-struct PendingUpload {
-    id: AtlasTextureId,
-    bounds: Bounds<DevicePixels>,
-    data: Vec<u8>,
-}
-
 struct WgpuAtlasTextures {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     max_texture_size: u32,
     color_texture_format: wgpu::TextureFormat,
     storage: WgpuAtlasStorage,
-    pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    uploads_pending: bool,
 }
 
 pub struct WgpuTextureInfo {
@@ -57,8 +51,8 @@ impl WgpuAtlas {
             max_texture_size,
             color_texture_format,
             storage: WgpuAtlasStorage::default(),
-            pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            uploads_pending: false,
         })))
     }
 
@@ -70,15 +64,28 @@ impl WgpuAtlas {
         )
     }
 
-    pub fn before_frame(&self) {
-        let mut lock = self.0.lock();
-        lock.backend.flush_uploads();
+    /// Reset before submitting to this atlas's queue, never afterwards: a
+    /// concurrent insert must keep its flag even if it races with submission.
+    pub(crate) fn before_submit(&self) {
+        self.0.lock().backend.uploads_pending = false;
     }
 
-    /// Returns the view backing `id`, or `None` once every tile in it has been
-    /// removed. A scene can still reference such a texture when a cached view
-    /// replays a paint from before the image was dropped, so callers must skip
-    /// those sprites rather than assume the texture exists.
+    /// A skipped frame still has to advance staged uploads. Submit outside the
+    /// atlas lock; WGPU retains their textures until the submission completes.
+    pub(crate) fn submit_pending_uploads(&self) {
+        let queue = {
+            let mut state = self.0.lock();
+            if !std::mem::take(&mut state.backend.uploads_pending) {
+                return;
+            }
+            state.backend.queue.clone()
+        };
+        queue.submit([]);
+    }
+
+    /// Returns the view backing `id`, or `None` after its last tile is retired.
+    /// Removed image keys keep their tiles until the replayable scene releases
+    /// them. Recovery may invalidate all pages independently of scene contents.
     pub fn get_texture_info(&self, id: AtlasTextureId) -> Option<WgpuTextureInfo> {
         let lock = self.0.lock();
         let texture = lock.backend.storage.get(id)?;
@@ -93,7 +100,6 @@ impl WgpuAtlas {
     pub fn clear(&self) {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
-            textures.pending_uploads.clear();
         });
     }
 
@@ -106,7 +112,7 @@ impl WgpuAtlas {
             textures.max_texture_size = context.device.limits().max_texture_dimension_2d;
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
-            textures.pending_uploads.clear();
+            textures.uploads_pending = false;
         });
     }
 }
@@ -158,8 +164,6 @@ impl AtlasBackend for WgpuAtlasTextures {
             texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
-                self.pending_uploads
-                    .retain(|upload| upload.id != texture.id);
                 self.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
@@ -274,43 +278,38 @@ impl WgpuAtlasTextures {
         bounds: Bounds<DevicePixels>,
         bytes: Cow<'_, [u8]>,
     ) {
-        let format = self.storage.get(id).map(|texture| texture.format);
-        let data = swizzle_upload_data(bytes, format.unwrap_or(wgpu::TextureFormat::Bgra8Unorm));
-        self.pending_uploads
-            .push(PendingUpload { id, bounds, data });
-    }
-
-    fn flush_uploads(&mut self) {
-        for upload in self.pending_uploads.drain(..) {
-            let Some(texture) = self.storage.get(upload.id) else {
-                continue;
-            };
-            let bytes_per_pixel = texture.bytes_per_pixel();
-
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: upload.bounds.origin.x.0 as u32,
-                        y: upload.bounds.origin.y.0 as u32,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
+        let texture = self
+            .storage
+            .get(id)
+            .expect("allocated atlas texture exists");
+        let data = swizzle_upload_data(bytes, texture.format);
+        // WGPU copies into its staging storage now and executes on the next
+        // submission. Keep borrowed pixels borrowed unless channel conversion
+        // requires a mutable buffer; there is no second CPU upload queue.
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: bounds.origin.x.0 as u32,
+                    y: bounds.origin.y.0 as u32,
+                    z: 0,
                 },
-                &upload.data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(upload.bounds.size.width.0 as u32 * bytes_per_pixel as u32),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: upload.bounds.size.width.0 as u32,
-                    height: upload.bounds.size.height.0 as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bounds.size.width.0 as u32 * texture.bytes_per_pixel() as u32),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: bounds.size.width.0 as u32,
+                height: bounds.size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.uploads_pending = true;
     }
 }
 
@@ -402,14 +401,13 @@ impl WgpuAtlasTexture {
     }
 }
 
-fn swizzle_upload_data(bytes: Cow<'_, [u8]>, format: wgpu::TextureFormat) -> Vec<u8> {
-    let mut data = bytes.into_owned();
+fn swizzle_upload_data(mut bytes: Cow<'_, [u8]>, format: wgpu::TextureFormat) -> Cow<'_, [u8]> {
     if format == wgpu::TextureFormat::Rgba8Unorm {
-        for pixel in data.as_chunks_mut::<4>().0 {
+        for pixel in bytes.to_mut().as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
     }
-    data
+    bytes
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -473,7 +471,6 @@ mod tests {
             let generation = backend.next_texture_generation;
             let page_count = backend.storage[kind].textures.len();
             let free_list = backend.storage[kind].free_list.clone();
-            let pending_upload_count = backend.pending_uploads.len();
             for _ in 0..8 {
                 for (width, height) in [(0, 1), (1, 0), (-1, 1), (1, -1), (66, 1), (1, 66)] {
                     let invalid_size = Size {
@@ -488,13 +485,10 @@ mod tests {
                     assert_eq!(backend.storage[kind].textures.len(), page_count);
                     assert_eq!(backend.storage[kind].free_list, free_list);
                     assert_eq!(backend.next_texture_generation, generation);
-                    assert_eq!(backend.pending_uploads.len(), pending_upload_count);
                     if let Some(tile) = keeper {
                         let texture = backend.storage.get(tile.texture_id).unwrap();
                         assert_eq!(texture.live_atlas_keys, 1);
                         assert_eq!(texture.generation, generation - 1);
-                        assert_eq!(backend.pending_uploads[0].bounds, tile.bounds);
-                        assert_eq!(backend.pending_uploads[0].data, [7; 65 * 65]);
                     }
                 }
             }
@@ -512,7 +506,6 @@ mod tests {
                         backend.storage[kind].free_list,
                         [tile.texture_id.index as usize]
                     );
-                    assert!(backend.pending_uploads.is_empty());
                 }
                 _ => {
                     let tile = backend.insert(kind, size, Cow::Borrowed(&[9; 65 * 65]))?;
@@ -526,34 +519,9 @@ mod tests {
                     backend.remove(tile);
                     assert!(backend.storage.get(tile.texture_id).is_none());
                     assert_eq!(backend.storage[kind].free_list.len(), 1);
-                    assert!(backend.pending_uploads.is_empty());
                 }
             }
         }
-        Ok(())
-    }
-
-    #[test]
-    fn before_frame_skips_uploads_for_removed_texture() -> anyhow::Result<()> {
-        let (device, queue) = test_device_and_queue()?;
-
-        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
-        let key = AtlasKey::Image(RenderImageParams {
-            image_id: ImageId(1),
-            frame_index: 0,
-        });
-        let size = Size {
-            width: DevicePixels(1),
-            height: DevicePixels(1),
-        };
-        let mut build = || Ok(Some((size, Cow::Owned(vec![0, 0, 0, 255]))));
-
-        // Regression test: before the fix, this panicked in flush_uploads
-        atlas
-            .get_or_insert_with(key.clone(), &mut build)?
-            .expect("tile should be created");
-        atlas.remove(&key);
-        atlas.before_frame();
         Ok(())
     }
 
@@ -596,6 +564,7 @@ mod tests {
         assert_eq!(keeper_tile.texture_id, tile_a.texture_id);
 
         atlas.remove(&big_key_a);
+        atlas.finish_frame(&gpui::Scene::default());
         let tile_b = insert(big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
         Ok(())
@@ -634,6 +603,7 @@ mod tests {
             .context("first texture should exist")?
             .generation;
         atlas.remove(&first_key);
+        atlas.finish_frame(&gpui::Scene::default());
         assert!(atlas.get_texture_info(first_tile.texture_id).is_none());
 
         let second_tile = insert(make_key(2));
@@ -644,6 +614,114 @@ mod tests {
 
         assert_eq!(second_tile.texture_id, first_tile.texture_id);
         assert_ne!(second_generation, first_generation);
+        Ok(())
+    }
+
+    #[test]
+    fn removed_image_pixels_survive_replay_until_scene_retirement() -> anyhow::Result<()> {
+        use gpui::{
+            ContentMask, Corners, PlatformHeadlessRenderer, PolychromeSprite, ScaledPixels, Scene,
+            TransformationMatrix,
+        };
+
+        let mut renderer = crate::WgpuHeadlessRenderer::new()?;
+        let atlas = renderer.sprite_atlas();
+        let key = |id| {
+            AtlasKey::Image(RenderImageParams {
+                image_id: ImageId(id),
+                frame_index: 0,
+            })
+        };
+        let insert = |id, pixel: [u8; 4]| {
+            atlas
+                .get_or_insert_with(key(id), &mut || {
+                    Ok(Some((
+                        Size::new(DevicePixels(1024), DevicePixels(1024)),
+                        Cow::Owned(pixel.repeat(1024 * 1024)),
+                    )))
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let old_tile = insert(91, [0, 0, 255, 255]);
+        // Window image cropping changes tile bounds, not allocation identity.
+        let mut cropped_tile = old_tile;
+        cropped_tile.bounds.origin = Point::new(DevicePixels(32), DevicePixels(32));
+        cropped_tile.bounds.size = Size::new(DevicePixels(64), DevicePixels(64));
+        let bounds = Bounds::new(
+            Point::default(),
+            Size::new(ScaledPixels(8.), ScaledPixels(8.)),
+        );
+        let sprite = PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false.into(),
+            opacity: 1.,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
+            tile: cropped_tile,
+            transformation: TransformationMatrix::default(),
+            source_tile_bounds: old_tile.bounds,
+            effects: gpui::ImageEffects::default(),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(sprite);
+        scene.finish();
+        let size = Size::new(DevicePixels(8), DevicePixels(8));
+        assert_eq!(
+            renderer
+                .render_scene_to_image(&scene, size)?
+                .get_pixel(4, 4)
+                .0,
+            [255, 0, 0, 255]
+        );
+
+        atlas.remove(&key(91));
+        assert!(!atlas.contains(&key(91)));
+        // Recreating the same key must not overwrite the old allocation, even
+        // before the first retirement hook has observed its scene.
+        let replacement = insert(91, [0, 255, 0, 255]);
+        assert_ne!(replacement.texture_id, old_tile.texture_id);
+        atlas.finish_frame(&scene);
+        assert_eq!(
+            renderer
+                .render_scene_to_image(&scene, size)?
+                .get_pixel(4, 4)
+                .0,
+            [255, 0, 0, 255]
+        );
+
+        let mut replay = Scene::default();
+        replay.replay(0..1, &scene);
+        replay.finish();
+        scene.clear();
+        atlas.finish_frame(&replay);
+        assert_eq!(
+            renderer
+                .render_scene_to_image(&replay, size)?
+                .get_pixel(4, 4)
+                .0,
+            [255, 0, 0, 255]
+        );
+        replay.clear();
+        atlas.finish_frame(&replay);
+        let reused = insert(92, [255, 0, 0, 255]);
+        assert_eq!(reused.texture_id, old_tile.texture_id);
+        let mut current = Scene::default();
+        current.insert_primitive(PolychromeSprite {
+            tile: replacement,
+            source_tile_bounds: replacement.bounds,
+            ..sprite
+        });
+        current.finish();
+        assert_eq!(
+            renderer
+                .render_scene_to_image(&current, size)?
+                .get_pixel(4, 4)
+                .0,
+            [0, 255, 0, 255]
+        );
         Ok(())
     }
 

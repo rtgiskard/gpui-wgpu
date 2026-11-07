@@ -918,7 +918,6 @@ mod tests {
                 Ok(Some((dimensions(96), Cow::Owned(vec![255; 96 * 8 * 4]))))
             })?
             .unwrap();
-        atlas.before_frame();
         let old_generation = atlas
             .get_texture_info(old_tile.texture_id)
             .unwrap()
@@ -947,7 +946,6 @@ mod tests {
             })?
             .unwrap();
         assert!(rebuilt, "recovery must rebuild the old cached key");
-        atlas.before_frame();
         let texture = atlas.get_texture_info(tile.texture_id).unwrap();
         assert_ne!(texture.generation, old_generation);
         let cached = atlas

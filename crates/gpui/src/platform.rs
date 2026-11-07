@@ -1755,6 +1755,8 @@ pub trait PlatformAtlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+    /// Invalidates a key. Window-local atlases retain its allocation while the
+    /// scene supplied to `finish_frame` can still present or replay that tile.
     fn remove(&self, key: &AtlasKey);
 
     /// Called after the previous frame has been discarded. `scene` must contain
@@ -1783,6 +1785,7 @@ pub trait AtlasBackend {
 #[doc(hidden)]
 pub struct AtlasState<Backend> {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    retired_tiles: FxHashMap<(AtlasTextureId, u32), (AtlasTile, bool)>,
     glyph_count: usize,
     low_glyph_demand_frames: u16,
     pub backend: Backend,
@@ -1792,6 +1795,7 @@ impl<Backend> AtlasState<Backend> {
     pub fn new(backend: Backend) -> Self {
         Self {
             tiles_by_key: FxHashMap::default(),
+            retired_tiles: FxHashMap::default(),
             glyph_count: 0,
             low_glyph_demand_frames: 0,
             backend,
@@ -1804,6 +1808,7 @@ impl<Backend> AtlasState<Backend> {
 
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
         self.tiles_by_key.clear();
+        self.retired_tiles.clear();
         self.glyph_count = 0;
         self.low_glyph_demand_frames = 0;
         reset_backend(&mut self.backend);
@@ -1846,14 +1851,50 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
             if matches!(key, AtlasKey::Glyph(_)) {
                 self.glyph_count -= 1;
             }
-            self.backend.remove(tile);
+            self.retired_tiles
+                .insert((tile.texture_id, tile.tile_id.0), (tile, false));
         }
     }
 
-    /// Retains whole pages referenced by the only replayable scene, rather than
-    /// evicting individual least-recently-used glyphs behind cached paint ranges.
-    /// Images and SVGs have separate ownership and are never evicted here.
+    /// Retires removed tiles absent from the only replayable scene, then reclaims
+    /// unused glyph pages after sustained low demand. Live image and SVG keys
+    /// have separate ownership and are never evicted by glyph reclamation.
     pub fn finish_frame(&mut self, scene: &Scene) {
+        if !self.retired_tiles.is_empty() {
+            // Removal invalidates the key immediately, but cached paint still
+            // owns the allocation until the sole replayable scene releases it.
+            let mut keep = |tile: &AtlasTile| {
+                if let Some((_, referenced)) = self
+                    .retired_tiles
+                    .get_mut(&(tile.texture_id, tile.tile_id.0))
+                {
+                    *referenced = true;
+                }
+            };
+            for sprite in &scene.monochrome_sprites {
+                keep(&sprite.tile);
+            }
+            for sprite in &scene.subpixel_sprites {
+                keep(&sprite.tile);
+            }
+            for sprite in &scene.polychrome_sprites {
+                keep(&sprite.tile);
+            }
+            let backend = &mut self.backend;
+            self.retired_tiles.retain(|_, (tile, referenced)| {
+                if std::mem::take(referenced) {
+                    true
+                } else {
+                    backend.remove(*tile);
+                    false
+                }
+            });
+            let retained_capacity = self.retired_tiles.len().max(32);
+            if self.retired_tiles.capacity() > retained_capacity.saturating_mul(4) {
+                self.retired_tiles.shrink_to(retained_capacity);
+            }
+        }
+
         const GLYPH_HIGH_WATER: usize = 8192;
         const LOW_DEMAND_FRAMES: u16 = 120;
 
@@ -3699,6 +3740,7 @@ mod atlas_tests {
         state.remove(&key);
         assert!(!state.contains(&key));
         assert!(state.contains(&other_key));
+        state.finish_frame(&Scene::default());
         assert_eq!(state.backend.removed_tiles, vec![tile]);
 
         let mut reset_calls = 0;

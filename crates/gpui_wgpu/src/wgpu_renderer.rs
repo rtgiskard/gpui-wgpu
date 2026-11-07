@@ -280,7 +280,8 @@ enum InstanceData {
     // stages while preserving integer and floating-point bit patterns exactly.
     Texture {
         texture: wgpu::Texture,
-        view: wgpu::TextureView,
+        // Cloned into each draw binding, retaining this allocation after rollover.
+        bind_group: wgpu::BindGroup,
         width: u32,
         height: u32,
     },
@@ -769,6 +770,7 @@ impl WgpuRendererCore {
 
     fn create_instance_texture(
         device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
         requested_capacity: u64,
         max_texture_dimension: u32,
     ) -> (InstanceData, u64) {
@@ -793,11 +795,19 @@ impl WgpuRendererCore {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("instance_texture_bind_group"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
         let capacity = u64::from(width) * u64::from(height) * INSTANCE_TEXTURE_TEXEL_SIZE;
         (
             InstanceData::Texture {
                 texture,
-                view,
+                bind_group,
                 width,
                 height,
             },
@@ -1251,6 +1261,20 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        let presented = self.draw_inner(scene);
+        if !presented {
+            self.submit_pending_atlas_uploads();
+        }
+        presented
+    }
+
+    fn submit_pending_atlas_uploads(&self) {
+        if !self.device_lost() {
+            self.atlas.submit_pending_uploads();
+        }
+    }
+
+    fn draw_inner(&mut self, scene: &Scene) -> bool {
         // Surface acquisition can fail or be deliberately skipped. Maintenance
         // still belongs to the real scene/window lifecycle in all those cases.
         if let Some(core) = self.core() {
@@ -1398,8 +1422,12 @@ impl WgpuRendererCore {
                 * INSTANCE_TEXTURE_TEXEL_SIZE)
                 .min(MAX_INSTANCE_BUFFER_SIZE);
             let initial_capacity = INITIAL_INSTANCE_DATA_CAPACITY.min(max_instance_data_size);
-            let (instance_data, capacity) =
-                Self::create_instance_texture(&device, initial_capacity, max_texture_dimension);
+            let (instance_data, capacity) = Self::create_instance_texture(
+                &device,
+                &bind_group_layouts.instances,
+                initial_capacity,
+                max_texture_dimension,
+            );
             (
                 instance_data,
                 capacity,
@@ -1741,8 +1769,6 @@ impl WgpuRendererCore {
             self.max_texture_size
         );
 
-        self.atlas.before_frame();
-
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1804,6 +1830,7 @@ impl WgpuRendererCore {
             self.low_path_sprite_peak = 0;
             self.resources.invalidate_surface_targets();
             self.release_frame_plan();
+            self.atlas.before_submit();
             self.resources.queue.submit(std::iter::empty());
             self.resources
                 .materials
@@ -2188,6 +2215,7 @@ impl WgpuRendererCore {
             filters.present(&mut encoder, &self.resources.queue, frame_view);
         }
 
+        self.atlas.before_submit();
         let submission = self
             .resources()
             .queue
@@ -2733,27 +2761,25 @@ impl WgpuRendererCore {
                 }
             }
         }
-        let bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &resources.bind_group_layouts.instances,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: match &resources.instance_data {
-                        InstanceData::Storage(buffer) => {
-                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        let bind_group = match &resources.instance_data {
+            InstanceData::Storage(buffer) => {
+                resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout: &resources.bind_group_layouts.instances,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer,
                                 offset,
                                 size: NonZeroU64::new(size),
-                            })
-                        }
-                        InstanceData::Texture { view, .. } => {
-                            wgpu::BindingResource::TextureView(view)
-                        }
-                    },
-                }],
-            });
+                            }),
+                        }],
+                    })
+            }
+            InstanceData::Texture { bind_group, .. } => bind_group.clone(),
+        };
         Ok(InstanceBinding {
             bind_group,
             first_instance,
@@ -2793,7 +2819,21 @@ impl WgpuRendererCore {
             let available_texels = u64::from(*width - x);
             let remaining_bytes = data.len() - byte_offset;
             let complete_texels = remaining_bytes as u64 / INSTANCE_TEXTURE_TEXEL_SIZE;
-            let texels = complete_texels.min(available_texels);
+            // Finish a partial first row, then upload every complete row in one
+            // rectangle. Leave a partial last row and its padded texel separate.
+            // Clamp to the actual allocation so overflow follows the existing
+            // diagnostic path on the next iteration rather than a GPU error.
+            let full_rows = if x == 0 {
+                (complete_texels / u64::from(*width)).min(u64::from(*height - y))
+            } else {
+                0
+            };
+            let (row_texels, rows) = if full_rows > 0 {
+                (u64::from(*width), full_rows as u32)
+            } else {
+                (complete_texels.min(available_texels), 1)
+            };
+            let texels = row_texels * u64::from(rows);
             if texels > 0 {
                 let byte_count = (texels * INSTANCE_TEXTURE_TEXEL_SIZE) as usize;
                 resources.queue.write_texture(
@@ -2806,12 +2846,12 @@ impl WgpuRendererCore {
                     &data[byte_offset..byte_offset + byte_count],
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(byte_count as u32),
+                        bytes_per_row: Some((row_texels * INSTANCE_TEXTURE_TEXEL_SIZE) as u32),
                         rows_per_image: None,
                     },
                     wgpu::Extent3d {
-                        width: texels as u32,
-                        height: 1,
+                        width: row_texels as u32,
+                        height: rows,
                         depth_or_array_layers: 1,
                     },
                 );
@@ -2901,8 +2941,12 @@ impl WgpuRendererCore {
         let resources = self.resources_mut();
         if uses_webgl_instance_data {
             let max_texture_dimension = resources.device.limits().max_texture_dimension_2d;
-            let (instance_data, actual_capacity) =
-                Self::create_instance_texture(&resources.device, capacity, max_texture_dimension);
+            let (instance_data, actual_capacity) = Self::create_instance_texture(
+                &resources.device,
+                &resources.bind_group_layouts.instances,
+                capacity,
+                max_texture_dimension,
+            );
             resources.instance_data = instance_data;
             self.instance_data_capacity = actual_capacity;
         } else {
@@ -2927,6 +2971,7 @@ impl WgpuRenderer {
     /// (e.g. Android `TerminateWindow`) but you intend to re-create the
     /// surface later without losing cached atlas textures.
     pub fn unconfigure_surface(&mut self) {
+        self.submit_pending_atlas_uploads();
         self.state = match std::mem::replace(&mut self.state, RendererState::Released) {
             RendererState::Ready { core, surface } => {
                 drop(surface);
@@ -3011,6 +3056,7 @@ impl WgpuRenderer {
     }
 
     pub fn destroy(&mut self) {
+        self.submit_pending_atlas_uploads();
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
         self.state = RendererState::Released;
@@ -4619,6 +4665,75 @@ mod tests {
                 assert_pixel(&image, 24, 8, BLUE);
                 renderer.render_scene_no_readback(&Scene::default(), size)?;
                 assert!(renderer.core.resources.atlas_texture_bind_groups.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn webgl_texture_rows_and_padded_sprites_preserve_pixels_across_rollover() -> anyhow::Result<()>
+    {
+        for sprite_count in [3, 5] {
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            renderer.core.use_webgl_instance_data_for_test();
+            // Eleven texels per row forces quad records across rows. Three
+            // sprites start partway through a row and end in a padded texel;
+            // five instead force rollover while the quad binding remains live.
+            let resources = &mut renderer.core.resources;
+            let (allocation, capacity) = WgpuRendererCore::create_instance_texture(
+                &resources.device,
+                &resources.bind_group_layouts.instances,
+                11 * 11 * INSTANCE_TEXTURE_TEXEL_SIZE,
+                11,
+            );
+            resources.instance_data = allocation;
+            renderer.core.instance_data_capacity = capacity;
+            let tile = image_tile(&renderer, 988, 1, 1, &[255, 0, 0, 255])?;
+            let mut scene = Scene::default();
+            for index in 0..6 {
+                let color = if index % 2 == 0 {
+                    gpui::red()
+                } else {
+                    gpui::blue()
+                };
+                scene.insert_primitive(solid_quad(index as f32 * 16., 0., 16., 16., color));
+            }
+            for index in 0..sprite_count {
+                let bounds = solid_quad(index as f32 * 16., 16., 16., 16., gpui::blue()).bounds;
+                scene.insert_primitive(PolychromeSprite {
+                    order: 0,
+                    pad: 0,
+                    grayscale: false.into(),
+                    opacity: 1.0,
+                    bounds,
+                    content_mask: ContentMask { bounds },
+                    corner_radii: Corners::default(),
+                    tile,
+                    transformation: gpui::TransformationMatrix::default(),
+                    source_tile_bounds: tile.bounds,
+                    effects: gpui::ImageEffects::default(),
+                });
+            }
+            scene.finish();
+            for _ in 0..2 {
+                let image = renderer.render_scene_to_image(&scene, device_size(96, 32))?;
+                for index in 0..6 {
+                    assert_pixel(
+                        &image,
+                        index * 16 + 8,
+                        8,
+                        if index % 2 == 0 { RED } else { BLUE },
+                    );
+                }
+                for index in 0..6 {
+                    assert_pixel(
+                        &image,
+                        index * 16 + 8,
+                        24,
+                        if index < sprite_count { BLUE } else { BLACK },
+                    );
+                }
             }
         }
         Ok(())
