@@ -1,11 +1,10 @@
 use std::{
-    fs::File,
     io::{ErrorKind, Write},
-    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
 };
 
 use calloop::{LoopHandle, PostAction};
-use filedescriptor::Pipe;
+use filedescriptor::{FileDescriptor, Pipe};
 use strum::IntoEnumIterator;
 use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
@@ -227,31 +226,139 @@ impl Clipboard {
     }
 
     pub fn send_bytes(&self, fd: OwnedFd, bytes: Vec<u8>) {
+        send_bytes(&self.loop_handle, fd, bytes);
+    }
+}
+
+fn send_bytes(loop_handle: &LoopHandle<'static, ()>, fd: OwnedFd, bytes: Vec<u8>) {
+    // Take ownership without duplicating the descriptor. Readiness alone does not
+    // make a large write nonblocking when the receiving application stops reading.
+    let mut file = unsafe { FileDescriptor::from_raw_fd(fd.into_raw_fd()) };
+    if let Err(err) = file.set_non_blocking(true) {
+        log::error!("failed to make clipboard pipe nonblocking: {err}");
+        return;
+    }
+    let mut written = 0;
+    loop_handle
+        .insert_source(
+            calloop::generic::Generic::new(file, calloop::Interest::WRITE, calloop::Mode::Level),
+            move |_, file, _| {
+                let file = unsafe { file.get_mut() };
+                Ok(write_available(file, &bytes, &mut written))
+            },
+        )
+        .unwrap();
+}
+
+fn write_available(file: &mut impl Write, bytes: &[u8], written: &mut usize) -> PostAction {
+    while *written < bytes.len() {
+        match file.write(&bytes[*written..]) {
+            Ok(0) => return PostAction::Remove,
+            Ok(n) => *written += n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => return PostAction::Continue,
+            Err(_) => return PostAction::Remove,
+        }
+    }
+    PostAction::Remove
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        collections::VecDeque,
+        io::{self, Read},
+        time::Duration,
+    };
+
+    struct ScriptedWriter {
+        results: VecDeque<io::Result<usize>>,
+        received: Vec<u8>,
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let result = self.results.pop_front().expect("unexpected extra write");
+            if let Ok(n) = result {
+                self.received.extend_from_slice(&bytes[..n]);
+            }
+            result
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn partial_writes_resume_after_backpressure_without_losing_bytes() {
+        let mut writer = ScriptedWriter {
+            results: VecDeque::from([
+                Ok(2),
+                Err(io::Error::from(ErrorKind::Interrupted)),
+                Err(io::Error::from(ErrorKind::WouldBlock)),
+                Ok(3),
+            ]),
+            received: Vec::new(),
+        };
         let mut written = 0;
-        self.loop_handle
-            .insert_source(
-                calloop::generic::Generic::new(
-                    File::from(fd),
-                    calloop::Interest::WRITE,
-                    calloop::Mode::Level,
-                ),
-                move |_, file, _| {
-                    let file = unsafe { file.get_mut() };
-                    loop {
-                        match file.write(&bytes[written..]) {
-                            Ok(n) if written + n == bytes.len() => {
-                                written += n;
-                                break Ok(PostAction::Remove);
-                            }
-                            Ok(n) => written += n,
-                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                                break Ok(PostAction::Continue);
-                            }
-                            Err(_) => break Ok(PostAction::Remove),
-                        }
-                    }
-                },
-            )
-            .unwrap();
+        assert!(matches!(
+            write_available(&mut writer, b"abcde", &mut written),
+            PostAction::Continue
+        ));
+        assert_eq!(written, 2);
+        assert!(matches!(
+            write_available(&mut writer, b"abcde", &mut written),
+            PostAction::Remove
+        ));
+        assert_eq!(written, 5);
+        assert_eq!(writer.received, b"abcde");
+    }
+
+    #[test]
+    fn zero_write_removes_the_source_instead_of_spinning() {
+        let mut writer = ScriptedWriter {
+            results: VecDeque::from([Ok(0)]),
+            received: Vec::new(),
+        };
+        assert!(matches!(
+            write_available(&mut writer, b"data", &mut 0),
+            PostAction::Remove
+        ));
+        assert!(writer.results.is_empty());
+    }
+
+    #[test]
+    fn large_clipboard_transfer_yields_to_a_slow_pipe_reader() {
+        let mut event_loop = calloop::EventLoop::<()>::try_new().unwrap();
+        let mut pipe = Pipe::new().unwrap();
+        pipe.read.set_non_blocking(true).unwrap();
+        let raw_fd = pipe.write.as_raw_fd();
+        let fd = unsafe { OwnedFd::from_raw_fd(pipe.write.into_raw_fd()) };
+        let bytes = (0..256 * 1024).map(|n| n as u8).collect::<Vec<_>>();
+        send_bytes(&event_loop.handle(), fd, bytes.clone());
+        // Check before dispatch so a regression fails instead of hanging the test.
+        let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+
+        // With no reader yet, this must return after filling the pipe.
+        event_loop.dispatch(Duration::ZERO, &mut ()).unwrap();
+        let mut received = Vec::new();
+        let mut chunk = [0; 4096];
+        for _ in 0..4096 {
+            event_loop.dispatch(Duration::ZERO, &mut ()).unwrap();
+            match pipe.read.read(&mut chunk) {
+                Ok(0) => {
+                    assert_eq!(received, bytes);
+                    return;
+                }
+                Ok(n) => received.extend_from_slice(&chunk[..n]),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => panic!("clipboard pipe read failed: {err}"),
+            }
+        }
+        panic!("clipboard transfer did not finish");
     }
 }
