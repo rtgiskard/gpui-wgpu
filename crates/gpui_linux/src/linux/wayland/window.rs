@@ -185,7 +185,10 @@ impl WaylandSurfaceState {
 
             layer_surface.set_anchor(super::layer_shell::wayland_anchor(options.anchor));
             layer_surface.set_keyboard_interactivity(
-                super::layer_shell::wayland_keyboard_interactivity(options.keyboard_interactivity),
+                super::layer_shell::wayland_keyboard_interactivity(
+                    options.keyboard_interactivity,
+                    layer_surface.version(),
+                ),
             );
 
             if let Some(margin) = options.margin {
@@ -477,13 +480,17 @@ impl WaylandSurfaceState {
 
     /// An exclusive edge must be a single edge that the surface is anchored to,
     /// otherwise the compositor raises a fatal `invalid_exclusive_edge` protocol
-    /// error. An invalid edge is logged and ignored. Returns whether it applied.
+    /// error. An invalid edge, or one the compositor's protocol version predates,
+    /// is logged and ignored. Returns whether it applied.
     fn apply_exclusive_edge(
         layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         anchor: Anchor,
         edge: Anchor,
     ) -> bool {
-        if edge.bits().count_ones() == 1 && anchor.contains(edge) {
+        if layer_surface.version() < zwlr_layer_surface_v1::REQ_SET_EXCLUSIVE_EDGE_SINCE {
+            log::warn!("ignoring exclusive edge {edge:?}: unsupported by the compositor");
+            false
+        } else if edge.bits().count_ones() == 1 && anchor.contains(edge) {
             layer_surface.set_exclusive_edge(super::layer_shell::wayland_anchor(edge));
             true
         } else {
