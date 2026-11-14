@@ -125,6 +125,14 @@ ordinary/wrapped double-frame cache reclamation remain in place. Platform/input/
 scheduler migrations and hot reload are deferred. Taffy is pinned to 0.15.0;
 layout consumers should verify grid/flex sizing and measured content when updating.
 
+SVG parsing and rasterization use usvg/resvg 0.50. Font coverage checks use the
+same Skrifa 0.49 release line as usvg, preserving collection-face selection and
+missing-glyph fallback without a direct ttf-parser dependency. Consumers must
+refresh their lockfile when adopting this change. Cosmic-text 0.19 still uses
+fontdb 0.23, which retains ttf-parser; removing that remaining dependency requires
+a separate text-stack migration. Platform/support crates and their AccessKit
+integration remain on the pinned Zed baseline.
+
 ## Development
 
 Use the pinned Rust toolchain. Linux builds need a C/C++ toolchain, pkg-config and

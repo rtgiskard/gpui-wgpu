@@ -44,7 +44,7 @@
 ["dependencies"]
 "num_cpus" = "1.13"
 "parking" = "2.0.0"
-"ttf-parser" = "0.25"
+"skrifa" = "0.49"
 "seahash" = "4.1"
 "waker-fn" = "1.2.0"
 "lyon" = "1.0"
@@ -171,12 +171,12 @@
 "rev" = "df48a139ce9c292738b523252c12f044697e673f"
 
 ["dependencies"."resvg"]
-"version" = "0.46.0"
+"version" = "0.50.0"
 "default-features" = false
 "features" = ["text", "system-fonts", "memmap-fonts", "raster-images"]
 
 ["dependencies"."usvg"]
-"version" = "0.46.0"
+"version" = "0.50.0"
 "default-features" = false
 
 ["dependencies"."schemars"]
