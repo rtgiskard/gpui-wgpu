@@ -1022,7 +1022,7 @@ pub struct RequestFrameOptions {
     pub require_presentation: bool,
     /// Force refresh of all rendering states when true.
     pub force_render: bool,
-    /// When the platform first requested this frame, before main-thread dispatch.
+    /// Backend-captured frame signal time; Wayland captures callback receipt.
     ///
     /// `None` means the captured request time is unavailable.
     /// Coalesced requests carry their first request time, not their delivery time.

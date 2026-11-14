@@ -62,8 +62,8 @@ their independent shading.
 - `crates/gpui_platform`: cross-platform application/platform constructors
 - `tests/fixtures/fonts`: deterministic upstream font fixtures with their licenses
 
-The Linux and platform-constructor sources are imported unchanged from Zed's
-baseline revision. Other platform and support crates still come from that pinned
+The Linux and platform-constructor sources were initially imported unchanged from
+Zed's baseline; adopted fixes are recorded below. Other platform/support crates use that pinned
 revision. Keep all four maintained crates on the same commit and review framework
 types, platform adapters, Rust/shader layouts and resource lifetimes together.
 
@@ -128,7 +128,7 @@ Linux and renderer patches. Adoption and remaining candidates are recorded below
 | --- | --- |
 | `985bbf42e684` | Apply cosmic-text glyph x/y offsets when building ShapedGlyph positions, preserving mark placement |
 | `decd2399b180` | Capture cached/deferred paint reads and restore live subscriptions; isolate nested window construction/draw contexts while retaining local replay ownership |
-| `bfcd5949ff82` | Prioritize Wayland callback receipt timing; local baseline still assumes a monotonic protocol timestamp |
+| `bfcd5949ff82` | Measure Wayland frame signals from callback receipt; remove protocol-clock inference and its obsolete tests |
 | `c7bea343838f`, `78fde14d124d` | Review drag cursor precedence and list horizontal padding with application layout/input acceptance |
 | `4023e3c88e0a`, `22580c6e6970`, `ddb90e5e89d3`, `62682ebde9e7` | Acquire wrappers only for truncation, skip absent backgrounds, share empty features, avoid copied cache-hit text and sort tab stops lazily; preserve local window-thread caches, replay and font-run scratch |
 | `415d310e5260` | Requires coordinating the external gpui_shared_string crate, not just the four maintained crates |

@@ -148,7 +148,7 @@ pub struct InputTiming {
 pub struct PlatformSignal {
     /// The window receiving the callback.
     pub window_id: WindowId,
-    /// When the platform requested the callback, if its clock is supported.
+    /// Backend-captured frame signal time; Wayland uses callback receipt time.
     pub signal_at: Option<Instant>,
     /// When foreground handling began.
     pub handled_at: Instant,
