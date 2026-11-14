@@ -1181,36 +1181,14 @@ impl Element for InteractiveText {
                         window.set_cursor_style(crate::CursorStyle::PointingHand, hitbox)
                     }
 
-                    let text_layout = text_layout.clone();
+                    // Register down and up together every frame: a tap or a fast click can
+                    // deliver both within one frame, before any repaint could add the up handler.
                     let mouse_down = interactive_state.mouse_down_index.clone();
-                    if let Some(mouse_down_index) = mouse_down.get() {
+                    window.on_mouse_event({
                         let hitbox = hitbox.clone();
-                        let clickable_ranges = mem::take(&mut self.clickable_ranges);
-                        window.on_mouse_event(
-                            move |event: &MouseUpEvent, phase, window: &mut Window, cx| {
-                                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                                    if let Ok(mouse_up_index) =
-                                        text_layout.index_for_position(event.position)
-                                    {
-                                        click_listener(
-                                            &clickable_ranges,
-                                            InteractiveTextClickEvent {
-                                                mouse_down_index,
-                                                mouse_up_index,
-                                            },
-                                            window,
-                                            cx,
-                                        )
-                                    }
-
-                                    mouse_down.take();
-                                    window.refresh();
-                                }
-                            },
-                        );
-                    } else {
-                        let hitbox = hitbox.clone();
-                        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _| {
+                        let text_layout = text_layout.clone();
+                        let mouse_down = mouse_down.clone();
+                        move |event: &MouseDownEvent, phase, window, _| {
                             if phase == DispatchPhase::Bubble
                                 && hitbox.is_hovered(window)
                                 && let Ok(mouse_down_index) =
@@ -1219,8 +1197,37 @@ impl Element for InteractiveText {
                                 mouse_down.set(Some(mouse_down_index));
                                 window.refresh();
                             }
-                        });
-                    }
+                        }
+                    });
+
+                    let hitbox = hitbox.clone();
+                    let text_layout = text_layout.clone();
+                    let clickable_ranges = mem::take(&mut self.clickable_ranges);
+                    window.on_mouse_event(
+                        move |event: &MouseUpEvent, phase, window: &mut Window, cx| {
+                            if phase != DispatchPhase::Bubble {
+                                return;
+                            }
+                            let Some(mouse_down_index) = mouse_down.take() else {
+                                return;
+                            };
+                            if hitbox.is_hovered(window)
+                                && let Ok(mouse_up_index) =
+                                    text_layout.index_for_position(event.position)
+                            {
+                                click_listener(
+                                    &clickable_ranges,
+                                    InteractiveTextClickEvent {
+                                        mouse_down_index,
+                                        mouse_up_index,
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            }
+                            window.refresh();
+                        },
+                    );
                 }
 
                 window.on_mouse_event({
@@ -1345,5 +1352,105 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+
+    struct ClickableText(Rc<std::cell::Cell<usize>>);
+    impl crate::Render for ClickableText {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            let clicks = self.0.clone();
+            InteractiveText::new("link", StyledText::new("hello world"))
+                .on_click(Vec::from([0..11]), move |_, _, _| {
+                    clicks.set(clicks.get() + 1)
+                })
+        }
+    }
+
+    /// Opens a window rendering a clickable `InteractiveText` covering 0..11.
+    fn clickable_text_window(
+        cx: &mut crate::TestAppContext,
+    ) -> (Rc<std::cell::Cell<usize>>, crate::AnyWindowHandle) {
+        let clicks = Rc::new(std::cell::Cell::new(0));
+        let window = cx.add_window({
+            let clicks = clicks.clone();
+            move |_, _| ClickableText(clicks)
+        });
+        cx.run_until_parked();
+        (clicks, window.into())
+    }
+
+    /// Dispatches `events` within one window update, so no frame can run between them.
+    fn dispatch(
+        cx: &mut crate::TestAppContext,
+        window: crate::AnyWindowHandle,
+        events: Vec<crate::PlatformInput>,
+    ) {
+        crate::AppContext::update_window(cx, window, |_, window, cx| {
+            for event in events {
+                window.dispatch_event(event, cx);
+            }
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn mouse_move(at: Point<Pixels>) -> crate::PlatformInput {
+        crate::PlatformInput::MouseMove(crate::MouseMoveEvent {
+            position: at,
+            pressed_button: None,
+            modifiers: crate::Modifiers::none(),
+        })
+    }
+
+    fn mouse_down(at: Point<Pixels>) -> crate::PlatformInput {
+        crate::PlatformInput::MouseDown(MouseDownEvent {
+            position: at,
+            modifiers: crate::Modifiers::none(),
+            button: crate::MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        })
+    }
+
+    fn mouse_up(at: Point<Pixels>) -> crate::PlatformInput {
+        crate::PlatformInput::MouseUp(MouseUpEvent {
+            position: at,
+            modifiers: crate::Modifiers::none(),
+            button: crate::MouseButton::Left,
+            click_count: 1,
+        })
+    }
+
+    #[crate::test]
+    fn interactive_text_clicks_on_first_press_without_repaint(cx: &mut crate::TestAppContext) {
+        use crate::{point, px};
+
+        let (clicks, window) = clickable_text_window(cx);
+        let on_text = point(px(1.), px(1.));
+        dispatch(cx, window, vec![mouse_move(on_text)]);
+        // As a recognized touch tap does: down and up with no frame in between.
+        dispatch(cx, window, vec![mouse_down(on_text), mouse_up(on_text)]);
+        assert_eq!(clicks.get(), 1);
+    }
+
+    #[crate::test]
+    fn interactive_text_ignores_release_outside_text(cx: &mut crate::TestAppContext) {
+        use crate::{point, px};
+
+        let (clicks, window) = clickable_text_window(cx);
+        let on_text = point(px(1.), px(1.));
+        let outside = point(px(900.), px(900.));
+        dispatch(cx, window, vec![mouse_move(on_text)]);
+        dispatch(cx, window, vec![mouse_down(on_text)]);
+        dispatch(cx, window, vec![mouse_move(outside), mouse_up(outside)]);
+        assert_eq!(clicks.get(), 0);
+
+        // The abandoned press must not pair with a later release back on the text.
+        dispatch(cx, window, vec![mouse_move(on_text)]);
+        dispatch(cx, window, vec![mouse_up(on_text)]);
+        assert_eq!(clicks.get(), 0);
     }
 }
