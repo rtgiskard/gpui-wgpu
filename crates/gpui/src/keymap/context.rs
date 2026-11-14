@@ -70,28 +70,33 @@ impl KeyContext {
     }
 
     fn parse_expr(mut source: &str, context: &mut Self) -> Result<()> {
-        if source.is_empty() {
-            return Ok(());
-        }
-
-        let key = source
-            .chars()
-            .take_while(|c| is_identifier_char(*c))
-            .collect::<String>();
-        source = skip_whitespace(&source[key.len()..]);
-        if let Some(suffix) = source.strip_prefix('=') {
-            source = skip_whitespace(suffix);
-            let value = source
+        while !source.is_empty() {
+            let key = source
                 .chars()
                 .take_while(|c| is_identifier_char(*c))
                 .collect::<String>();
-            source = skip_whitespace(&source[value.len()..]);
-            context.set(key, value);
-        } else {
-            context.add(key);
+            anyhow::ensure!(
+                !key.is_empty(),
+                "expected a context identifier at {source:?}"
+            );
+            source = skip_whitespace(&source[key.len()..]);
+            if let Some(suffix) = source.strip_prefix('=') {
+                source = skip_whitespace(suffix);
+                let value = source
+                    .chars()
+                    .take_while(|c| is_identifier_char(*c))
+                    .collect::<String>();
+                anyhow::ensure!(
+                    !value.is_empty(),
+                    "expected a value for context key {key:?}"
+                );
+                source = skip_whitespace(&source[value.len()..]);
+                context.set(key, value);
+            } else {
+                context.add(key);
+            }
         }
-
-        Self::parse_expr(source, context)
+        Ok(())
     }
 
     /// Check if this context is empty.
@@ -548,6 +553,22 @@ mod tests {
             expected
         );
         assert_eq!(KeyContext::parse(" baz foo = bar").unwrap(), expected);
+    }
+
+    #[test]
+    fn context_parse_rejects_invalid_tokens() {
+        for source in ["Editor:", ":", "=value", "mode=", "mode=:", "mode==visible"] {
+            assert!(KeyContext::parse(source).is_err(), "accepted {source:?}");
+        }
+    }
+
+    #[test]
+    fn context_parse_handles_long_input_without_recursion() {
+        let source = vec!["Editor"; 20_000].join(" ");
+        assert_eq!(
+            KeyContext::parse(&source).unwrap(),
+            KeyContext::parse("Editor").unwrap()
+        );
     }
 
     #[test]

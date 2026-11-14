@@ -314,7 +314,17 @@ impl PathBuilder {
         path: &lyon::path::Path,
         options: &StrokeOptions,
     ) -> Result<Path<Pixels>, Error> {
-        let path = if let Some(dash_array) = dash_array {
+        let mut has_dashes = false;
+        if let Some(dash_array) = &dash_array {
+            for length in dash_array {
+                anyhow::ensure!(
+                    length.0.is_finite() && length.0 >= 0.0,
+                    "dash lengths must be finite and nonnegative"
+                );
+                has_dashes |= length.0 > 0.0;
+            }
+        }
+        let path = if let Some(dash_array) = dash_array.filter(|_| has_dashes) {
             let measurements = lyon::algorithms::measure::PathMeasurements::from_path(path, 0.01);
             let mut sampler = measurements
                 .create_sampler(path, lyon::algorithms::measure::SampleType::Normalized);
@@ -327,6 +337,10 @@ impl PathBuilder {
             while pos < total_length {
                 let dash_length = dash_array[dash_index % dash_array_len].0;
                 let next_pos = (pos + dash_length).min(total_length);
+                anyhow::ensure!(
+                    dash_length == 0.0 || next_pos > pos,
+                    "dash length is too small to advance along the path"
+                );
                 if dash_index % 2 == 0 {
                     let start = pos / total_length;
                     let end = next_pos / total_length;
@@ -413,6 +427,44 @@ mod tests {
             .iter()
             .map(|vertex| (vertex.xy_position, vertex.st_position, vertex.content_mask))
             .collect()
+    }
+
+    #[test]
+    fn empty_and_zero_dash_arrays_preserve_solid_stroke_geometry() {
+        let line = |dashes: Option<&[Pixels]>| {
+            let mut builder = PathBuilder::stroke(px(2.0));
+            if let Some(dashes) = dashes {
+                builder = builder.dash_array(dashes);
+            }
+            builder.move_to(point(px(0.0), px(0.0)));
+            builder.line_to(point(px(20.0), px(0.0)));
+            builder.build().unwrap()
+        };
+        let solid = line(None);
+        for dashes in [&[][..], &[px(0.0)][..], &[px(0.0), px(0.0)][..]] {
+            let path = line(Some(dashes));
+            assert_eq!(geometry(&path), geometry(&solid));
+            assert_eq!(path.bounds, solid.bounds);
+        }
+    }
+
+    #[test]
+    fn dash_sampling_rejects_invalid_lengths_but_keeps_zero_gaps() {
+        let line = |dashes: &[Pixels]| {
+            let mut builder = PathBuilder::stroke(px(2.0)).dash_array(dashes);
+            builder.move_to(point(px(0.0), px(0.0)));
+            builder.line_to(point(px(20.0), px(0.0)));
+            builder.build()
+        };
+        for invalid in [f32::NAN, f32::INFINITY, -1.0] {
+            assert!(line(&[px(2.0), px(invalid)]).is_err());
+        }
+        assert!(line(&[px(2.0), px(f32::MIN_POSITIVE)]).is_err());
+        let solid = line(&[]).unwrap();
+        let zero_gaps = line(&[px(2.0), px(0.0)]).unwrap();
+        assert_eq!(zero_gaps.bounds, solid.bounds);
+        let dashed = line(&[px(0.0), px(1.0), px(2.0), px(1.0)]).unwrap();
+        assert_ne!(geometry(&dashed), geometry(&solid));
     }
 
     #[test]

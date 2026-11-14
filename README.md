@@ -81,6 +81,9 @@ Device loss hands the old queue to recovery; submitted commands retain their res
 WebGL bindings belong to each texture allocation; rollover must preserve earlier
 draws rather than overwrite or release their storage.
 
+`KeyContext::parse` rejects malformed tokens and missing keys or values. Stroke
+dash lengths must be finite and nonnegative; empty or all-zero arrays draw solid strokes.
+
 ## Upstream tracking
 
 External support and platform crates remain pinned to the baseline above. Backport
