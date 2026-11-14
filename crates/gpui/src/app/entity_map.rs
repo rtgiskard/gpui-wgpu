@@ -11,6 +11,7 @@ use std::{
     fmt::{self, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
+    mem,
     num::NonZeroU64,
     sync::{
         Arc, Weak,
@@ -55,8 +56,23 @@ impl Display for EntityId {
 
 pub(crate) struct EntityMap {
     entities: SecondaryMap<EntityId, Box<dyn Any>>,
-    pub accessed_entities: RefCell<FxHashSet<EntityId>>,
+    accessed_entities: RefCell<AccessedEntities>,
+    drawing: bool,
     ref_counts: Arc<RwLock<EntityRefCounts>>,
+}
+
+/// Reads are recorded in the innermost scope and merged into its parent when
+/// it ends, so each scope retains reads also made earlier in the frame.
+#[derive(Default)]
+pub(crate) struct AccessedEntities {
+    frame: FxHashSet<EntityId>,
+    scopes: Vec<FxHashSet<EntityId>>,
+}
+
+impl AccessedEntities {
+    fn innermost(&mut self) -> &mut FxHashSet<EntityId> {
+        self.scopes.last_mut().unwrap_or(&mut self.frame)
+    }
 }
 
 #[doc(hidden)]
@@ -75,7 +91,8 @@ impl EntityMap {
     pub fn new() -> Self {
         Self {
             entities: SecondaryMap::new(),
-            accessed_entities: RefCell::new(FxHashSet::default()),
+            accessed_entities: RefCell::new(AccessedEntities::default()),
+            drawing: false,
             ref_counts: Arc::new(RwLock::new(EntityRefCounts {
                 counts: SlotMap::with_key(),
                 dropped_entity_ids: Vec::new(),
@@ -125,8 +142,10 @@ impl EntityMap {
     where
         T: 'static,
     {
-        let mut accessed_entities = self.accessed_entities.get_mut();
-        accessed_entities.insert(slot.entity_id);
+        self.accessed_entities
+            .get_mut()
+            .innermost()
+            .insert(slot.entity_id);
 
         let handle = slot.0;
         self.entities.insert(handle.entity_id, Box::new(entity));
@@ -177,14 +196,88 @@ impl EntityMap {
         );
     }
 
-    pub fn extend_accessed(&mut self, entities: &FxHashSet<EntityId>) {
-        self.accessed_entities
-            .get_mut()
-            .extend(entities.iter().copied());
+    /// Restores reads from reused draws, skipping entities released since the
+    /// recording so their removed window subscriptions are not resurrected.
+    pub fn extend_accessed(&mut self, entities: impl IntoIterator<Item = EntityId>) {
+        let ref_counts = self.ref_counts.read();
+        self.accessed_entities.get_mut().innermost().extend(
+            entities
+                .into_iter()
+                .filter(|entity_id| ref_counts.counts.contains_key(*entity_id)),
+        );
+    }
+
+    /// Starts a window's independent read context. Only reentrant draws move
+    /// the suspended context out; ordinary draws reuse their set allocations.
+    pub fn begin_accessed_frame(&mut self) -> Option<AccessedEntities> {
+        if mem::replace(&mut self.drawing, true) {
+            Some(mem::take(self.accessed_entities.get_mut()))
+        } else {
+            self.clear_accessed();
+            None
+        }
+    }
+
+    /// Window construction precedes its first draw. Keep those reads out of a
+    /// suspended caller too, without introducing a frame for top-level opens.
+    pub fn suspend_accessed_frame(&mut self) -> Option<AccessedEntities> {
+        mem::replace(&mut self.drawing, false).then(|| mem::take(self.accessed_entities.get_mut()))
+    }
+
+    pub fn end_accessed_frame(&mut self, outer: Option<AccessedEntities>) {
+        if let Some(mut outer) = outer {
+            // An inner draw can release entities and clean up subscriptions
+            // while the outer sets are suspended, beyond take_dropped's reach.
+            let ref_counts = self.ref_counts.read();
+            let is_live = |entity_id: &EntityId| ref_counts.counts.contains_key(*entity_id);
+            outer.frame.retain(is_live);
+            for scope in &mut outer.scopes {
+                scope.retain(is_live);
+            }
+            *self.accessed_entities.get_mut() = outer;
+            self.drawing = true;
+        } else {
+            self.clear_accessed();
+            self.drawing = false;
+        }
     }
 
     pub fn clear_accessed(&mut self) {
-        self.accessed_entities.get_mut().clear();
+        let accessed_entities = self.accessed_entities.get_mut();
+        accessed_entities.scopes.clear();
+        accessed_entities.frame.clear();
+    }
+
+    pub fn push_access_scope(&mut self) {
+        self.accessed_entities
+            .get_mut()
+            .scopes
+            .push(FxHashSet::default());
+    }
+
+    /// Ends the innermost scope and adds its reads to the surrounding scope.
+    pub fn pop_access_scope(&mut self) -> FxHashSet<EntityId> {
+        let accessed_entities = self.accessed_entities.get_mut();
+        let Some(scope) = accessed_entities.scopes.pop() else {
+            debug_assert!(false, "popped an access scope that wasn't pushed");
+            return FxHashSet::default();
+        };
+        accessed_entities.innermost().extend(scope.iter().copied());
+        scope
+    }
+
+    /// Takes the frame's reads for subscription updates, then restoration.
+    pub fn take_accessed(&mut self) -> FxHashSet<EntityId> {
+        let accessed_entities = self.accessed_entities.get_mut();
+        debug_assert!(
+            accessed_entities.scopes.is_empty(),
+            "access scope left open"
+        );
+        mem::take(&mut accessed_entities.frame)
+    }
+
+    pub fn restore_accessed(&mut self, entities: FxHashSet<EntityId>) {
+        self.accessed_entities.get_mut().frame = entities;
     }
 
     pub fn take_dropped(&mut self) -> Vec<(EntityId, Box<dyn Any>)> {
@@ -200,7 +293,10 @@ impl EntityMap {
                     0,
                     "dropped an entity that was referenced"
                 );
-                accessed_entities.remove(&entity_id);
+                accessed_entities.frame.remove(&entity_id);
+                for scope in &mut accessed_entities.scopes {
+                    scope.remove(&entity_id);
+                }
                 // If the EntityId was allocated with `Context::reserve`,
                 // the entity may not have been inserted.
                 Some((entity_id, self.entities.remove(entity_id)?))
@@ -210,14 +306,19 @@ impl EntityMap {
 
     #[inline(never)]
     fn read_inner(&self, entity_id: EntityId) -> Option<&dyn Any> {
-        let mut accessed_entities = self.accessed_entities.borrow_mut();
-        accessed_entities.insert(entity_id);
+        self.accessed_entities
+            .borrow_mut()
+            .innermost()
+            .insert(entity_id);
         self.entities.get(entity_id).map(Box::as_ref)
     }
 
     #[inline(never)]
     fn lease_inner(&mut self, entity_id: EntityId) -> Option<Box<dyn Any>> {
-        self.accessed_entities.get_mut().insert(entity_id);
+        self.accessed_entities
+            .get_mut()
+            .innermost()
+            .insert(entity_id);
         self.entities.remove(entity_id)
     }
 
@@ -1215,9 +1316,91 @@ impl fmt::Debug for BacktraceFormatter {
 #[cfg(test)]
 mod test {
     use crate::EntityMap;
+    use collections::FxHashSet;
 
     struct TestEntity {
         pub i: i32,
+    }
+
+    #[test]
+    fn test_accessed_entity_scopes() {
+        let mut entity_map = EntityMap::new();
+        let slot = entity_map.reserve::<TestEntity>();
+        let first = entity_map.insert(slot, TestEntity { i: 1 });
+        let slot = entity_map.reserve::<TestEntity>();
+        let second = entity_map.insert(slot, TestEntity { i: 2 });
+        entity_map.clear_accessed();
+
+        entity_map.read(&first);
+        entity_map.push_access_scope();
+        entity_map.read(&first);
+        entity_map.push_access_scope();
+        entity_map.read(&second);
+        let inner = entity_map.pop_access_scope();
+        entity_map.push_access_scope();
+        entity_map.read(&first);
+        let sibling = entity_map.pop_access_scope();
+        let outer = entity_map.pop_access_scope();
+
+        let both = FxHashSet::from_iter([first.entity_id(), second.entity_id()]);
+        assert_eq!(inner, FxHashSet::from_iter([second.entity_id()]));
+        assert_eq!(sibling, FxHashSet::from_iter([first.entity_id()]));
+        assert_eq!(outer, both);
+        assert_eq!(entity_map.take_accessed(), both);
+
+        drop(second);
+        entity_map.take_dropped();
+        entity_map.extend_accessed(both);
+        assert_eq!(
+            entity_map.take_accessed(),
+            FxHashSet::from_iter([first.entity_id()]),
+            "a released entity shouldn't be recorded again"
+        );
+    }
+
+    #[test]
+    fn test_nested_accessed_frames() {
+        let mut entity_map = EntityMap::new();
+        let slot = entity_map.reserve::<TestEntity>();
+        let outer_entity = entity_map.insert(slot, TestEntity { i: 1 });
+        let slot = entity_map.reserve::<TestEntity>();
+        let released = entity_map.insert(slot, TestEntity { i: 2 });
+        let slot = entity_map.reserve::<TestEntity>();
+        let inner_entity = entity_map.insert(slot, TestEntity { i: 3 });
+
+        let outer = entity_map.begin_accessed_frame();
+        entity_map.read(&outer_entity);
+        entity_map.read(&released);
+        entity_map.push_access_scope();
+        entity_map.read(&released);
+        let inner = entity_map.begin_accessed_frame();
+        entity_map.read(&inner_entity);
+        drop(released);
+        entity_map.take_dropped();
+        assert_eq!(
+            entity_map.take_accessed(),
+            FxHashSet::from_iter([inner_entity.entity_id()]),
+            "the inner window must not subscribe to outer reads"
+        );
+        entity_map.end_accessed_frame(inner);
+        assert!(entity_map.pop_access_scope().is_empty());
+        assert_eq!(
+            entity_map.take_accessed(),
+            FxHashSet::from_iter([outer_entity.entity_id()]),
+            "restoration must exclude inner reads and released outer reads"
+        );
+
+        // Isolation also applies outside a cached/deferred access scope.
+        entity_map.read(&outer_entity);
+        let inner = entity_map.begin_accessed_frame();
+        entity_map.read(&inner_entity);
+        entity_map.end_accessed_frame(inner);
+        assert_eq!(
+            entity_map.take_accessed(),
+            FxHashSet::from_iter([outer_entity.entity_id()])
+        );
+        entity_map.end_accessed_frame(outer);
+        assert!(entity_map.take_accessed().is_empty());
     }
 
     #[test]

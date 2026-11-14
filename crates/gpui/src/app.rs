@@ -1367,15 +1367,9 @@ impl App {
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
     ) -> (R, FxHashSet<EntityId>) {
-        // Capture all accesses in this scope, including entities already accessed
-        // by its caller. Cached views must retain those shared dependencies too.
-        let outer_accessed = mem::take(self.entities.accessed_entities.get_mut());
+        self.entities.push_access_scope();
         let result = callback(self);
-        let entities_accessed_in_callback =
-            mem::replace(self.entities.accessed_entities.get_mut(), outer_accessed);
-        self.entities
-            .extend_accessed(&entities_accessed_in_callback);
-        (result, entities_accessed_in_callback)
+        (result, self.entities.pop_access_scope())
     }
 
     pub(crate) fn record_entities_accessed(
@@ -1521,9 +1515,10 @@ impl App {
         build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
     ) -> anyhow::Result<WindowHandle<V>> {
         self.update(|cx| {
+            let outer_accessed = cx.entities.suspend_accessed_frame();
             let id = cx.windows.insert(None);
             let handle = WindowHandle::new(id);
-            match Window::new(handle.into(), options, cx) {
+            let result = match Window::new(handle.into(), options, cx) {
                 Ok(mut window) => {
                     cx.window_update_stack.push(id);
                     let root_view = build_root_view(&mut window, cx);
@@ -1546,7 +1541,11 @@ impl App {
                     cx.windows.remove(id);
                     Err(e)
                 }
+            };
+            if let Some(outer_accessed) = outer_accessed {
+                cx.entities.end_accessed_frame(Some(outer_accessed));
             }
+            result
         })
     }
 

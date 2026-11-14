@@ -122,12 +122,12 @@ Last scanned Zed revision: `f0fa51bb510fc91f6da7ec55f3e0f317f1f975ec`
 
 The 2026-11-14 review triaged the 165 Zed commits since the previous scan
 `ba63a022c9a22ca66d68ef2a8f0bb9b5b0a9984d`, inspecting selected framework,
-Linux and renderer patches. The following are candidates, not adopted changes:
+Linux and renderer patches. Adoption and remaining candidates are recorded below:
 
 | Upstream commits | Disposition |
 | --- | --- |
 | `985bbf42e684` | Prioritize combining-mark positioning: local CosmicTextSystem still ignores glyph x/y offsets |
-| `decd2399b180` | Prioritize cached-view subscriptions for paint and deferred reads; coordinate with local replay ownership |
+| `decd2399b180` | Capture cached/deferred paint reads and restore live subscriptions; isolate nested window construction/draw contexts while retaining local replay ownership |
 | `bfcd5949ff82` | Prioritize Wayland callback receipt timing; local baseline still assumes a monotonic protocol timestamp |
 | `c7bea343838f`, `78fde14d124d` | Review drag cursor precedence and list horizontal padding with application layout/input acceptance |
 | `4023e3c88e0a`, `22580c6e6970`, `ddb90e5e89d3`, `62682ebde9e7` | Text/focus work reduction candidates; retain local window-thread caches and font-run scratch |
@@ -136,6 +136,14 @@ Linux and renderer patches. The following are candidates, not adopted changes:
 | `aff99ecc3249` | Separate retained SVG-animation migration; preserve local transformed-sprite/replay contracts |
 | `64ef8026c7bc` | Coordinated framework/Linux window-placement API migration |
 | `8e474e159887` | No change needed: local renderer already passes premultiplied-alpha state through uniforms |
+
+Cached/deferred reads are recorded per window across prepaint and paint. Opening
+a window synchronously from those callbacks suspends the enclosing recording
+context; inner construction/draw reads do not subscribe the outer window, and
+released entities are filtered when restoring it. Ordinary non-nested draws reuse
+their recording storage. A plain non-view model read subscribes the window but
+does not itself create a cached-subtree invalidation path; existing view
+invalidation and explicit refresh semantics still apply.
 
 WGPU was compared from the pinned `cddb2f5d80dc0009b2ef6767635140cacf90a007`
 to `bceb82ba1d7fa61dfe0afab3a26514c6367cab93` (268 commits). Selected candidates
