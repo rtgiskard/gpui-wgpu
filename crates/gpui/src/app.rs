@@ -2181,6 +2181,9 @@ impl App {
         tid: TypeId,
         window: Option<WindowId>,
     ) {
+        // The creating window may have closed between creation and this flush; the
+        // entity then has no window.
+        let window = window.filter(|id| self.windows.contains_key(*id));
         // Seed the entity's current window from its creation context so
         // `with_window` resolves correctly before the entity has ever been
         // rendered.
@@ -2189,7 +2192,9 @@ impl App {
         }
 
         self.new_entity_observers.clone().retain(&tid, |observer| {
-            if let Some(id) = window {
+            if let Some(id) = window
+                && self.windows.contains_key(id)
+            {
                 self.update_window_id(id, {
                     let entity = entity.clone();
                     |_, window, cx| (observer)(entity, &mut Some(window), cx)

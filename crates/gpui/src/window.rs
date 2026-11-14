@@ -8513,6 +8513,31 @@ mod tests {
     }
 
     #[gpui::test]
+    fn new_entity_observers_run_after_the_creating_window_closes(cx: &mut TestAppContext) {
+        struct Created;
+        let seen = Rc::new(Cell::new(None));
+        let _observer = cx.update(|cx| {
+            let seen = seen.clone();
+            cx.observe_new::<Created>(move |_, window, _| seen.set(Some(window.is_some())))
+        });
+        let window = cx.add_window(|_, _| EmptyView);
+        let created = window
+            .update(cx, |_, window, cx| {
+                let created = cx.new(|_| Created);
+                window.remove_window();
+                created
+            })
+            .unwrap();
+        assert_eq!(seen.get(), Some(false));
+        cx.update(|cx| {
+            assert!(
+                cx.with_window(created.entity_id(), |_, _| ()).is_none(),
+                "entity kept a closed window as its current window"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn cached_children_follow_inherited_opacity_changes(cx: &mut TestAppContext) {
         struct Child;
         impl Render for Child {
