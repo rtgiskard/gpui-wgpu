@@ -172,6 +172,23 @@ fontdb 0.23, which retains ttf-parser; removing that remaining dependency requir
 a separate text-stack migration. Platform/support crates and their AccessKit
 integration remain on the pinned Zed baseline.
 
+### Registry dependency refresh
+
+The 2026-11-14 refresh updates the workspace lockfile within existing version
+requirements, without advancing Git revisions, the exact Taffy pin or incompatible
+release lines. It replaces yanked async-executor 1.14.0 with 1.14.1 and resolves
+the certificate advisories with rustls-webpki 0.103.17 and webpki-roots /
+webpki-root-certs 1.0.12. Consumers must refresh their own lockfiles; this
+repository's lockfile does not constrain downstream resolution.
+
+notify-rust 4.19 uses zbus 6 alongside zbus 5 retained by AccessKit/AT-SPI, ashpd
+and oo7. Updating notifications alone does not remove the unmaintained
+zbus_names, zvariant and zvariant_derive crates. Remaining unmaintained paths
+also include cosmic-text/fontdb's ttf-parser, development HTTP support's
+rustls-pemfile and the pinned macOS renderer's metal/paste. The EXR dependency
+no longer introduces paste. These maintenance advisories are not suppressed;
+`cargo deny check advisories` still fails on them.
+
 ## Development
 
 Use the pinned Rust toolchain. Linux builds need a C/C++ toolchain, pkg-config and
