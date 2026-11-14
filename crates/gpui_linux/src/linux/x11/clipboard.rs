@@ -113,6 +113,8 @@ enum ManagerHandoverState {
 
 struct GlobalClipboard {
     inner: Arc<Inner>,
+    /// Live `Clipboard` handles; the last one to drop hands the data over.
+    handles: usize,
 
     /// Join handle to the thread which serves selection requests.
     server_handle: JoinHandle<()>,
@@ -719,20 +721,22 @@ impl Inner {
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
                 success = match data_list.iter().find(|d| d.format == event.target) {
-                    Some(data) => {
-                        self.server
-                            .conn
-                            .change_property8(
-                                PropMode::REPLACE,
-                                event.requestor,
-                                event.property,
-                                event.target,
-                                &data.bytes,
-                            )
-                            .map_err(into_unknown)?;
-                        self.server.conn.flush().map_err(into_unknown)?;
-                        true
-                    }
+                    // x11rb rejects a property larger than the server's request limit before
+                    // sending anything; refuse that request rather than stop serving.
+                    Some(data) => self
+                        .server
+                        .conn
+                        .change_property8(
+                            PropMode::REPLACE,
+                            event.requestor,
+                            event.property,
+                            event.target,
+                            &data.bytes,
+                        )
+                        .inspect_err(|error| {
+                            log::warn!("Failed to send clipboard contents: {error}")
+                        })
+                        .is_ok(),
                     None => false,
                 };
             } else {
@@ -887,10 +891,12 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
                     context.atom_name(event.selection),
                     context.atom_name(event.target),
                 );
-                // Someone is requesting the clipboard content from us.
-                context
-                    .handle_selection_request(event)
-                    .map_err(into_unknown)?;
+                // Someone is requesting the clipboard content from us. A failed reply only
+                // affects that request.
+                if let Err(error) = context.handle_selection_request(event) {
+                    log::warn!("Failed to answer a clipboard request: {error}");
+                    continue;
+                }
 
                 // if we are in the progress of saving to the clipboard manager
                 // make sure we save that we have finished writing
@@ -956,7 +962,8 @@ impl Clipboard {
     /// Returns the process's clipboard, connecting it to `display` if it doesn't exist yet.
     pub(crate) fn new(display: &str) -> Result<Self> {
         let mut global_cb = CLIPBOARD.lock();
-        if let Some(global_cb) = &*global_cb {
+        if let Some(global_cb) = &mut *global_cb {
+            global_cb.handles += 1;
             return Ok(Self {
                 inner: Arc::clone(&global_cb.inner),
             });
@@ -976,6 +983,7 @@ impl Clipboard {
             .unwrap();
         *global_cb = Some(GlobalClipboard {
             inner: Arc::clone(&ctx),
+            handles: 1,
             server_handle: join_handle,
         });
         Ok(Self { inner: ctx })
@@ -1079,17 +1087,18 @@ impl Clipboard {
 
 impl Drop for Clipboard {
     fn drop(&mut self) {
-        // There are always at least 3 owners:
-        // the global, the server thread, and one `Clipboard::inner`
-        const MIN_OWNERS: usize = 3;
-
-        // We start with locking the global guard to prevent race
-        // conditions below.
+        // Lock the global first so `new` cannot hand out this clipboard concurrently.
         let mut global_cb = CLIPBOARD.lock();
-        if Arc::strong_count(&self.inner) == MIN_OWNERS {
-            // If the are the only owners of the clipboard are ourselves and
-            // the global object, then we should destroy the global object,
-            // and send the data to the clipboard manager.
+        // Counted explicitly: the serving thread's reference disappears if it exits.
+        let Some(global) = global_cb
+            .as_mut()
+            .filter(|global| Arc::ptr_eq(&global.inner, &self.inner))
+        else {
+            return;
+        };
+        global.handles -= 1;
+        if global.handles == 0 {
+            // The last handle hands the data to the clipboard manager and destroys the global.
             //
             // The handover waits for the clipboard manager, so it runs on its own thread rather
             // than blocking this one, which can be the UI thread switching display modes. A
