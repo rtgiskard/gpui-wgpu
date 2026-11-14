@@ -666,26 +666,26 @@ impl Drop for ThreadTimings {
 }
 
 #[doc(hidden)]
-pub fn update_running_task(spawned: SpawnTime, location: &'static std::panic::Location<'_>) {
+#[cfg_attr(not(feature = "profiler"), inline(always))]
+pub fn update_running_task(_spawned: SpawnTime, _location: &'static std::panic::Location<'_>) {
     #[cfg(feature = "profiler")]
-    journal::begin_foreground_turn();
-    THREAD_TIMINGS.with(|timings| {
-        timings.lock().update_running_task(spawned, location);
-    });
+    {
+        journal::begin_foreground_turn();
+        THREAD_TIMINGS.with(|timings| {
+            timings.lock().update_running_task(_spawned, _location);
+        });
+    }
 }
 
 #[doc(hidden)]
+#[cfg_attr(not(feature = "profiler"), inline(always))]
 pub fn save_task_timing() {
-    let yielded_at = YieldTime(Instant::now());
     #[cfg(feature = "profiler")]
     {
+        let yielded_at = YieldTime(Instant::now());
         let timing = THREAD_TIMINGS.with(|timings| timings.lock().save_task_timing(yielded_at));
         journal::record_task_poll(timing);
     }
-    #[cfg(not(feature = "profiler"))]
-    THREAD_TIMINGS.with(|timings| {
-        timings.lock().save_task_timing(yielded_at);
-    });
 }
 
 #[doc(hidden)]

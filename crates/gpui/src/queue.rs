@@ -416,7 +416,7 @@ impl<T> Iterator for TryIter<T> {
         }
 
         let res = self.receiver.try_pop();
-        self.ended = res.is_err();
+        self.ended = !matches!(res, Ok(Some(_)));
 
         res.transpose()
     }
@@ -428,6 +428,30 @@ mod tests {
     use collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn try_iter_stays_exhausted_after_an_empty_queue() {
+        let (sender, receiver) = PriorityQueueReceiver::new();
+        let mut iter = receiver.clone().try_iter();
+        sender.send(Priority::Medium, 7).unwrap();
+        assert_eq!(iter.next().unwrap().unwrap(), 7);
+        assert!(iter.next().is_none());
+        sender.send(Priority::Medium, 8).unwrap();
+        assert!(iter.next().is_none());
+        assert_eq!(receiver.try_iter().next().unwrap().unwrap(), 8);
+        drop(sender);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn try_iter_reports_disconnect_once_then_stays_exhausted() {
+        let (sender, receiver) = PriorityQueueReceiver::<u32>::new();
+        drop(sender);
+        let mut iter = receiver.try_iter();
+        assert!(iter.next().unwrap().is_err());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
 
     #[test]
     fn blocked_receivers_end_when_the_sender_drops() {
