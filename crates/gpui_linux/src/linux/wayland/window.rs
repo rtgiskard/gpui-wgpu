@@ -2,13 +2,13 @@ use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     ffi::c_void,
     ptr::NonNull,
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::Arc,
     time::Instant,
 };
 
 use calloop::ping::Ping;
-use collections::{FxHashMap, HashMap};
+use collections::HashMap;
 use futures::channel::oneshot::Receiver;
 
 use raw_window_handle as rwh;
@@ -102,9 +102,9 @@ struct InProgressConfigure {
 pub struct WaylandWindowState {
     surface_state: WaylandSurfaceState,
     parent: Option<WaylandWindowStatePtr>,
-    /// Child surfaces mapped to whether they block this window's input (dialogs
-    /// block, popups don't). Children are closed before this window closes.
-    children: FxHashMap<ObjectId, bool>,
+    /// Children in creation order. Tear down newest-first to respect popup stacks.
+    children: Vec<ChildWindow>,
+    surface_destroyed: bool,
     pub surface: wl_surface::WlSurface,
     app_id: Option<String>,
     appearance: WindowAppearance,
@@ -116,6 +116,7 @@ pub struct WaylandWindowState {
     /// Taken when the window is dropped. Its GPU objects use the Wayland connection, so they
     /// mustn't outlive the window, which a display mode switch relies on.
     renderer: Option<WgpuRenderer>,
+    closed_atlas: Option<Arc<dyn PlatformAtlas>>,
     bounds: Bounds<Pixels>,
     scale: f32,
     input_handler: Option<PlatformInputHandler>,
@@ -140,6 +141,12 @@ pub struct WaylandWindowState {
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+}
+
+struct ChildWindow {
+    id: ObjectId,
+    state: Weak<RefCell<WaylandWindowState>>,
+    blocking: bool,
 }
 
 pub enum WaylandSurfaceState {
@@ -240,10 +247,6 @@ impl WaylandSurfaceState {
                 xdg_popup.grab(&seat, serial);
             }
 
-            // Non-blocking: the parent keeps its input so it can dismiss the popup on
-            // clicks in its own window.
-            parent.add_child(surface.id(), false);
-
             return Ok(WaylandSurfaceState::Popup(WaylandPopupSurfaceState {
                 xdg_surface,
                 xdg_popup,
@@ -270,10 +273,6 @@ impl WaylandSurfaceState {
                 xdg_dialog.set_modal();
                 xdg_dialog
             });
-
-            if let Some(parent) = parent.as_ref() {
-                parent.add_child(surface.id(), true);
-            }
 
             dialog
         } else {
@@ -607,7 +606,8 @@ impl WaylandWindowState {
         Ok(Self {
             surface_state,
             parent,
-            children: FxHashMap::default(),
+            children: Vec::new(),
+            surface_destroyed: false,
             surface,
             app_id: options.app_id,
             blur: None,
@@ -616,6 +616,7 @@ impl WaylandWindowState {
             outputs: HashMap::default(),
             display: None,
             renderer: Some(renderer),
+            closed_atlas: None,
             bounds: options.bounds,
             scale: 1.0,
             input_handler: None,
@@ -687,6 +688,41 @@ impl WaylandWindowState {
             WindowDecorations::Server => px(0.0),
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
         }
+    }
+
+    fn destroy_surface_tree(&mut self) {
+        if self.surface_destroyed {
+            return;
+        }
+        // App close callbacks only enqueue removal. Own the protocol teardown
+        // here instead: descendants must be gone before any ancestor role,
+        // even if App drops the ancestor directly or is shutting down.
+        for child in self.children.iter().rev() {
+            if let Some(child) = child.state.upgrade() {
+                child.borrow_mut().destroy_surface_tree();
+            }
+        }
+        self.surface_destroyed = true;
+        self.active = false;
+        self.hovered = false;
+        self.pending_frame_callback.take();
+        self.closed_atlas = self
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.sprite_atlas().clone() as Arc<dyn PlatformAtlas>);
+        self.renderer.take();
+        if let Some(blur) = self.blur.take() {
+            blur.release();
+        }
+        // Decorations precede the toplevel; each role precedes its xdg_surface.
+        if let Some(decoration) = self.surface_state.decoration() {
+            decoration.destroy();
+        }
+        self.surface_state.destroy();
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        self.surface.destroy();
     }
 }
 
@@ -775,36 +811,16 @@ impl Drop for WaylandWindow {
         let surface_id = state.surface.id();
 
         if let Some(parent) = state.parent.as_ref() {
-            parent.state.borrow_mut().children.remove(&surface_id);
+            parent
+                .state
+                .borrow_mut()
+                .children
+                .retain(|child| child.id != surface_id);
         }
 
         let client = state.client.clone();
 
-        state.renderer.take();
-
-        // Destroy blur first, this has no dependencies.
-        if let Some(blur) = &state.blur {
-            blur.release();
-        }
-
-        // Decorations must be destroyed before the xdg state.
-        // See https://wayland.app/protocols/xdg-decoration-unstable-v1#zxdg_toplevel_decoration_v1
-        if let Some(decoration) = &state.surface_state.decoration() {
-            decoration.destroy();
-        }
-
-        // Surface state might contain xdg_toplevel/xdg_surface which can be destroyed now that
-        // decorations are gone. layer_surface has no dependencies.
-        state.surface_state.destroy();
-
-        // Viewport must be destroyed before the wl_surface.
-        // See https://wayland.app/protocols/viewporter#wp_viewport
-        if let Some(viewport) = &state.viewport {
-            viewport.destroy();
-        }
-
-        // The wl_surface itself should always be destroyed last.
-        state.surface.destroy();
+        state.destroy_surface_tree();
 
         client.drop_window(&surface_id);
         let state_ptr = self.0.clone();
@@ -840,7 +856,18 @@ impl WaylandWindow {
         popup_grab: Option<(u32, wl_seat::WlSeat)>,
         target_output: Option<wl_output::WlOutput>,
     ) -> anyhow::Result<(Self, ObjectId)> {
+        if parent
+            .as_ref()
+            .is_some_and(|parent| parent.state.borrow().surface_destroyed)
+        {
+            return Err(anyhow::anyhow!("parent window is closing"));
+        }
         let surface = globals.compositor.create_surface(&globals.qh, ());
+        let child_blocking = match &params.kind {
+            WindowKind::Dialog => Some(true),
+            WindowKind::AnchoredPopup(_) => Some(false),
+            _ => None,
+        };
         let surface_state = WaylandSurfaceState::new(
             &surface,
             &globals,
@@ -879,6 +906,12 @@ impl WaylandWindow {
             frame_ping,
             scheduled_frame_at: Rc::new(Cell::new(None)),
         });
+        if let Some(blocking) = child_blocking {
+            let state = this.0.state.borrow();
+            if let Some(parent) = &state.parent {
+                parent.add_child(surface.id(), &this.0, blocking);
+            }
+        }
 
         // Kick things off
         surface.commit();
@@ -897,17 +930,29 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn toplevel(&self) -> Option<xdg_toplevel::XdgToplevel> {
-        self.state.borrow().surface_state.toplevel().cloned()
+        let state = self.state.borrow();
+        if state.surface_destroyed {
+            return None;
+        }
+        state.surface_state.toplevel().cloned()
     }
 
     /// The `xdg_surface` backing this window, if it has one. Used to anchor child popups.
     pub fn xdg_surface(&self) -> Option<xdg_surface::XdgSurface> {
-        self.state.borrow().surface_state.xdg_surface().cloned()
+        let state = self.state.borrow();
+        if state.surface_destroyed {
+            return None;
+        }
+        state.surface_state.xdg_surface().cloned()
     }
 
     /// The layer-shell surface backing this window, if it is one. Used to anchor child popups.
     pub fn layer_surface(&self) -> Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1> {
-        self.state.borrow().surface_state.layer_surface().cloned()
+        let state = self.state.borrow();
+        if state.surface_destroyed {
+            return None;
+        }
+        state.surface_state.layer_surface().cloned()
     }
 
     /// This window's xdg window geometry in surface-local coordinates. Child popup anchor
@@ -925,19 +970,26 @@ impl WaylandWindowStatePtr {
         Rc::ptr_eq(&self.state, &other.state)
     }
 
-    pub fn add_child(&self, child: ObjectId, blocking: bool) {
-        let mut state = self.state.borrow_mut();
-        state.children.insert(child, blocking);
+    fn add_child(&self, id: ObjectId, child: &Self, blocking: bool) {
+        self.state.borrow_mut().children.push(ChildWindow {
+            id,
+            state: Rc::downgrade(&child.state),
+            blocking,
+        });
     }
 
     pub fn is_blocked(&self) -> bool {
         let state = self.state.borrow();
-        state.children.values().any(|&blocking| blocking)
+        state.surface_destroyed || state.children.iter().any(|child| child.blocking)
     }
 
     pub fn frame(&self, signal_at: Option<Instant>, signal_source: FrameRequestSource) {
         self.frame_loop.set(FrameLoop::Ticking);
         let mut state = self.state.borrow_mut();
+        if state.surface_destroyed {
+            self.frame_loop.set(FrameLoop::Parked);
+            return;
+        }
         state.resize_throttle = false;
         // GPUI may throttle this tick without calling draw, so leave the request
         // latched until a draw actually reaches the renderer.
@@ -964,6 +1016,10 @@ impl WaylandWindowStatePtr {
 
     fn complete_frame(&self) {
         let mut state = self.state.borrow_mut();
+        if state.surface_destroyed {
+            self.frame_loop.set(FrameLoop::Parked);
+            return;
+        }
 
         let frame_loop = self.frame_loop.get();
         if frame_loop == FrameLoop::AwaitingCallback {
@@ -1038,6 +1094,9 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn schedule_frame(&self) {
+        if self.state.borrow().surface_destroyed {
+            return;
+        }
         match self.frame_loop.get() {
             FrameLoop::Parked => {
                 self.frame_loop.set(FrameLoop::Scheduled);
@@ -1061,7 +1120,7 @@ impl WaylandWindowStatePtr {
 
     fn update_ime_enabled(&self) {
         let mut state = self.state.borrow_mut();
-        if !state.active {
+        if state.surface_destroyed || !state.active {
             return;
         }
         let client = state.client.clone();
@@ -1089,6 +1148,9 @@ impl WaylandWindowStatePtr {
         if let xdg_surface::Event::Configure { serial } = event {
             {
                 let mut state = self.state.borrow_mut();
+                if state.surface_destroyed {
+                    return;
+                }
                 if let Some(window_controls) = state.in_progress_window_controls.take() {
                     state.window_controls = window_controls;
 
@@ -1101,6 +1163,9 @@ impl WaylandWindowStatePtr {
             }
             {
                 let mut state = self.state.borrow_mut();
+                if state.surface_destroyed {
+                    return;
+                }
 
                 if let Some(mut configure) = state.in_progress_configure.take() {
                     let got_unmaximized = state.maximized && !configure.maximized;
@@ -1144,6 +1209,9 @@ impl WaylandWindowStatePtr {
                 }
             }
             let state = self.state.borrow_mut();
+            if state.surface_destroyed {
+                return;
+            }
             state.surface_state.ack_configure(serial);
 
             let window_geometry = inset_by_tiling(
@@ -1172,6 +1240,9 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn handle_toplevel_decoration_event(&self, event: zxdg_toplevel_decoration_v1::Event) {
+        if self.state.borrow().surface_destroyed {
+            return;
+        }
         if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
             match mode {
                 WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ServerSide) => {
@@ -1206,6 +1277,9 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn handle_fractional_scale_event(&self, event: wp_fractional_scale_v1::Event) {
+        if self.state.borrow().surface_destroyed {
+            return;
+        }
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             self.rescale(scale as f32 / 120.0);
             self.request_redraw();
@@ -1213,6 +1287,9 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn handle_toplevel_event(&self, event: xdg_toplevel::Event) -> bool {
+        if self.state.borrow().surface_destroyed {
+            return false;
+        }
         match event {
             xdg_toplevel::Event::Configure {
                 width,
@@ -1328,6 +1405,9 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn handle_layersurface_event(&self, event: zwlr_layer_surface_v1::Event) -> bool {
+        if self.state.borrow().surface_destroyed {
+            return false;
+        }
         match event {
             zwlr_layer_surface_v1::Event::Configure {
                 width,
@@ -1366,6 +1446,9 @@ impl WaylandWindowStatePtr {
 
     // Returns `true` if the popup should be closed.
     pub fn handle_popup_event(&self, event: xdg_popup::Event) -> bool {
+        if self.state.borrow().surface_destroyed {
+            return false;
+        }
         match event {
             // Only the size is needed, the position is the compositor's. The following
             // xdg_surface.configure applies the change.
@@ -1401,6 +1484,9 @@ impl WaylandWindowStatePtr {
         outputs: HashMap<ObjectId, Output>,
     ) {
         let mut state = self.state.borrow_mut();
+        if state.surface_destroyed {
+            return;
+        }
 
         match event {
             wl_surface::Event::Enter { output } => {
@@ -1507,6 +1593,9 @@ impl WaylandWindowStatePtr {
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
         let (size, scale) = {
             let mut state = self.state.borrow_mut();
+            if state.surface_destroyed {
+                return;
+            }
             if size.is_none_or(|size| size == state.bounds.size)
                 && scale.is_none_or(|scale| scale == state.scale)
             {
@@ -1553,7 +1642,12 @@ impl WaylandWindowStatePtr {
         // Closing is deferred to a task, which can run after the client is dropped by a switch to
         // headless mode. The client's window map, and so any child window, is gone with it.
         let client = state.client.try_get_client();
-        let children = state.children.keys().cloned().collect::<Vec<_>>();
+        let children = state
+            .children
+            .iter()
+            .rev()
+            .map(|child| child.id.clone())
+            .collect::<Vec<_>>();
         drop(state);
 
         if let Some(client) = client {
@@ -1685,6 +1779,9 @@ where
 
 impl rwh::HasWindowHandle for WaylandWindow {
     fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
+        if self.borrow().surface_destroyed {
+            return Err(rwh::HandleError::Unavailable);
+        }
         let surface = self.0.surface().id().as_ptr() as *mut libc::c_void;
         let c_ptr = NonNull::new(surface).ok_or(rwh::HandleError::Unavailable)?;
         let handle = rwh::WaylandWindowHandle::new(c_ptr);
@@ -1750,6 +1847,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn resize(&mut self, size: Size<Pixels>) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         let state_ptr = self.0.clone();
 
         // A popup's placement is the compositor's, so a resize re-runs the positioner and the
@@ -1860,6 +1960,9 @@ impl PlatformWindow for WaylandWindow {
         // Try to request an activation token. Even though the activation is likely going to be rejected,
         // KWin and Mutter can use the app_id to visually indicate we're requesting attention.
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         if let (Some(activation), Some(app_id)) = (&state.globals.activation, state.app_id.clone())
         {
             state.client.set_pending_activation(state.surface.id());
@@ -1888,6 +1991,9 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn set_title(&mut self, title: &str) {
+        if self.borrow().surface_destroyed {
+            return;
+        }
         if let Some(toplevel) = self.borrow().surface_state.toplevel() {
             toplevel.set_title(title.to_string());
         }
@@ -1895,6 +2001,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_app_id(&mut self, app_id: &str) {
         let mut state = self.borrow_mut();
+        if state.surface_destroyed {
+            return;
+        }
         if let Some(toplevel) = state.surface_state.toplevel() {
             toplevel.set_app_id(app_id.to_owned());
         }
@@ -1926,6 +2035,9 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn minimize(&self) {
+        if self.borrow().surface_destroyed {
+            return;
+        }
         if let Some(toplevel) = self.borrow().surface_state.toplevel() {
             toplevel.set_minimized();
         }
@@ -1933,6 +2045,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn zoom(&self) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         if let Some(toplevel) = state.surface_state.toplevel() {
             if !state.maximized {
                 toplevel.set_maximized();
@@ -1944,6 +2059,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn toggle_fullscreen(&self) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         if let Some(toplevel) = state.surface_state.toplevel() {
             if !state.fullscreen {
                 toplevel.set_fullscreen(None);
@@ -2061,16 +2179,23 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        self.borrow()
-            .renderer
-            .as_ref()
-            .expect("the renderer is only taken when the window is dropped")
-            .sprite_atlas()
-            .clone()
+        let state = self.borrow();
+        if let Some(renderer) = &state.renderer {
+            renderer.sprite_atlas().clone()
+        } else {
+            state
+                .closed_atlas
+                .as_ref()
+                .expect("closed window retains its atlas")
+                .clone()
+        }
     }
 
     fn show_window_menu(&self, position: Point<Pixels>) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         let serial = state.client.get_serial(SerialKind::MousePress);
         if let Some(toplevel) = state.surface_state.toplevel() {
             toplevel.show_window_menu(
@@ -2084,6 +2209,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn start_window_move(&self) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         let serial = state.client.get_serial(SerialKind::MousePress);
         if let Some(toplevel) = state.surface_state.toplevel() {
             toplevel._move(&state.globals.seat, serial.as_raw());
@@ -2096,11 +2224,17 @@ impl PlatformWindow for WaylandWindow {
 
     fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return false;
+        }
         state.client.start_external_drag(&state.surface, payload)
     }
 
     fn start_window_resize(&self, edge: gpui::ResizeEdge) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         if let Some(toplevel) = state.surface_state.toplevel() {
             toplevel.resize(
                 &state.globals.seat,
@@ -2112,6 +2246,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_exclusive_zone(&self, zone: Pixels) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         if state
             .surface_state
             .set_exclusive_zone(f32::from(zone) as i32)
@@ -2124,6 +2261,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_exclusive_edge(&self, edge: Anchor) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         if state.surface_state.set_exclusive_edge(edge) {
             // Commit to apply it immediately, otherwise it only takes effect
             // on the next frame.
@@ -2133,6 +2273,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         match region {
             // No region means the whole surface receives input.
             None => state.surface.set_input_region(None),
@@ -2175,6 +2318,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn request_decorations(&self, decorations: WindowDecorations) {
         let mut state = self.borrow_mut();
+        if state.surface_destroyed {
+            return;
+        }
         match state.surface_state.decoration().as_ref() {
             Some(decoration) => {
                 decoration.set_mode(decorations.to_xdg());
@@ -2209,7 +2355,7 @@ impl PlatformWindow for WaylandWindow {
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let state = self.borrow();
-        if !state.active {
+        if state.surface_destroyed || !state.active {
             return;
         }
         state.client.update_ime_position(bounds);
@@ -2221,6 +2367,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn play_system_bell(&self) {
         let state = self.borrow();
+        if state.surface_destroyed {
+            return;
+        }
         let surface = if state.surface_state.toplevel().is_some() {
             Some(&state.surface)
         } else {
@@ -2287,6 +2436,9 @@ impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
 }
 
 fn update_window(mut state: RefMut<WaylandWindowState>) {
+    if state.surface_destroyed {
+        return;
+    }
     let opaque = !state.is_transparent();
 
     if let Some(renderer) = &mut state.renderer {

@@ -798,20 +798,19 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         let closed_window = state.windows.remove(surface_id).unwrap();
-        if let Some(window) = state.mouse_focused_window.take()
-            && !window.ptr_eq(&closed_window)
-        {
-            state.mouse_focused_window = Some(window);
+        // Descendants' surfaces were destroyed with this window, before their own close tasks
+        // run. `closed_window` is mutably borrowed by its Drop, so test identity first.
+        let released = |window: &WaylandWindowStatePtr| {
+            window.ptr_eq(&closed_window) || !window.surface().is_alive()
+        };
+        if state.mouse_focused_window.as_ref().is_some_and(released) {
+            state.mouse_focused_window = None;
         }
-        if let Some(window) = state.keyboard_focused_window.take()
-            && !window.ptr_eq(&closed_window)
-        {
-            state.keyboard_focused_window = Some(window);
+        if state.keyboard_focused_window.as_ref().is_some_and(released) {
+            state.keyboard_focused_window = None;
         }
-        if let Some(window) = state.cursor_hidden_window.take()
-            && !window.ptr_eq(&closed_window)
-        {
-            state.cursor_hidden_window = Some(window);
+        if state.cursor_hidden_window.as_ref().is_some_and(released) {
+            state.cursor_hidden_window = None;
         }
     }
 }
@@ -1397,7 +1396,10 @@ impl WaylandConnection {
         let mut state = self.0.borrow_mut();
         if let (Some(activation), Some(window)) = (
             state.globals.activation.clone(),
-            state.mouse_focused_window.clone(),
+            state
+                .mouse_focused_window
+                .clone()
+                .filter(|window| window.surface().is_alive()),
         ) {
             state.pending_activation = Some(PendingActivation::Uri(uri.to_string()));
             let token = activation.get_activation_token(&state.globals.qh, ());
@@ -1415,7 +1417,10 @@ impl WaylandConnection {
         let mut state = self.0.borrow_mut();
         if let (Some(activation), Some(window)) = (
             state.globals.activation.clone(),
-            state.mouse_focused_window.clone(),
+            state
+                .mouse_focused_window
+                .clone()
+                .filter(|window| window.surface().is_alive()),
         ) {
             state.pending_activation = Some(PendingActivation::Path(path));
             let token = activation.get_activation_token(&state.globals.qh, ());
@@ -1922,11 +1927,12 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
                     reveal_path_internal(executor, path, Some(token), environment)
                 }
                 Some(PendingActivation::Window(window)) => {
-                    let Some(window) = get_window(&mut state, &window) else {
-                        return;
-                    };
-                    let activation = state.globals.activation.as_ref().unwrap();
-                    activation.activate(token, &window.surface());
+                    if let Some(window) = get_window(&mut state, &window)
+                        && window.surface().is_alive()
+                    {
+                        let activation = state.globals.activation.as_ref().unwrap();
+                        activation.activate(token, &window.surface());
+                    }
                 }
                 None => log::error!("activation token received with no pending activation"),
             }
