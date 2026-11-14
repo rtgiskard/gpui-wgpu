@@ -151,13 +151,5 @@
 "rev" = "cddb2f5d80dc0009b2ef6767635140cacf90a007"
 "features" = ["wgsl-in"]
 
-# Standalone regression-test root; the application supplies its own patches.
-[workspace]
-resolver = "3"
-
-[patch."https://github.com/zed-industries/zed"]
-gpui = { path = "../gpui" }
-gpui_wgpu = { path = "." }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6" }

@@ -1,8 +1,8 @@
 # gpui-wgpu
 
-Pinned GPUI and WGPU renderer patches, extracted from Rivu. This repository
-maintains rendering and framework changes; it is not a replacement for the
-complete Zed workspace. GPU material APIs remain experimental. The maintained
+Pinned GPUI framework, WGPU renderer and Linux platform patches, extracted from
+Rivu and Zed. This repository is not a replacement for the complete Zed workspace.
+GPU material APIs remain experimental. The maintained
 application integration is Linux/WGPU; other platforms are not certified here.
 
 ## Source and history
@@ -58,11 +58,14 @@ their independent shading.
 
 - `crates/gpui`: drawing APIs, scene recording/replay, UI and text state
 - `crates/gpui_wgpu`: GPU execution, shaders, uploads and resource retirement
+- `crates/gpui_linux`: Linux/FreeBSD windowing, input, accessibility and desktop integration
+- `crates/gpui_platform`: cross-platform application/platform constructors
 - `tests/fixtures/fonts`: deterministic upstream font fixtures with their licenses
 
-Unmodified platform and support crates still come from the pinned Zed revision.
-Keep both patched crates on the same commit and review Rust/shader layouts,
-composition order and resource lifetimes together when updating upstream.
+The Linux and platform-constructor sources are imported unchanged from Zed's
+baseline revision. Other platform and support crates still come from that pinned
+revision. Keep all four maintained crates on the same commit and review framework
+types, platform adapters, Rust/shader layouts and resource lifetimes together.
 
 Window-local atlas removal invalidates lookup immediately; the frame-discard
 boundary releases storage only after the sole replayable scene no longer uses it.
@@ -80,13 +83,13 @@ draws rather than overwrite or release their storage.
 
 ## Upstream tracking
 
-Support and platform crates remain pinned to the baseline above. Backport selected
-fixes rather than replacing these two crates with upstream HEAD: renderer resource
+External support and platform crates remain pinned to the baseline above. Backport
+selected fixes rather than replacing the maintained crates with upstream HEAD: renderer resource
 retirement, material uploads and transformed sprites have local contracts that must
 survive each update. Sprite record layouts must also remain compatible with the
 pinned platform renderers; texture batching can be updated without changing ABI.
 
-Consumers should pin both crates to the same full commit during development.
+Consumers should pin all four maintained crates to the same full commit.
 Immutable release tags mark integration-tested milestones of this patch set,
 independently of Rivu's version; the `upstream/*` tags identify source snapshots,
 not supported releases. A consumer's lockfile records the exact adopted revision.
@@ -97,8 +100,9 @@ baseline: platform and support API migrations require a separate coordinated upd
 
 ### Reviewed upstream changes
 
-Last scanned Zed revision: `ba63a022c9a22ca66d68ef2a8f0bb9b5b0a9984d`.
-The support-crate baseline remains `df48a139ce9c292738b523252c12f044697e673f`.
+Last scanned Zed revision: `f0fa51bb510fc91f6da7ec55f3e0f317f1f975ec`
+(2026-11-14). The support-crate baseline remains
+`df48a139ce9c292738b523252c12f044697e673f`.
 
 | Upstream commits | Disposition |
 | --- | --- |
@@ -115,6 +119,33 @@ The support-crate baseline remains `df48a139ce9c292738b523252c12f044697e673f`.
 | `2a74c8dff6` | Removed unused hash-layout APIs and cache state; ordinary and wrapped replay retained |
 | `772a8a9100` | Window-local Rc/RefCell text caches and font-run scratch; shared font state remains synchronized |
 | `b488c4e814` | Taffy 0.15 measurement/alignment API migration, retaining device-pixel snapping and relative positioning |
+
+The 2026-11-14 review triaged the 165 Zed commits since the previous scan
+`ba63a022c9a22ca66d68ef2a8f0bb9b5b0a9984d`, inspecting selected framework,
+Linux and renderer patches. The following are candidates, not adopted changes:
+
+| Upstream commits | Disposition |
+| --- | --- |
+| `985bbf42e684` | Prioritize combining-mark positioning: local CosmicTextSystem still ignores glyph x/y offsets |
+| `decd2399b180` | Prioritize cached-view subscriptions for paint and deferred reads; coordinate with local replay ownership |
+| `bfcd5949ff82` | Prioritize Wayland callback receipt timing; local baseline still assumes a monotonic protocol timestamp |
+| `c7bea343838f`, `78fde14d124d` | Review drag cursor precedence and list horizontal padding with application layout/input acceptance |
+| `4023e3c88e0a`, `22580c6e6970`, `ddb90e5e89d3`, `62682ebde9e7` | Text/focus work reduction candidates; retain local window-thread caches and font-run scratch |
+| `415d310e5260` | Requires coordinating the external gpui_shared_string crate, not just the four maintained crates |
+| `ba490197cfb8`, `caead827d77c`, `ffe0fa29e41e`, `1d8eda94bd4d`, `be07e43ea0ad`, `d3fc053d5b62` | Separate rendering migration: clipping, paths, batching, depth and sorting interact with local materials, scene filters and replay |
+| `aff99ecc3249` | Separate retained SVG-animation migration; preserve local transformed-sprite/replay contracts |
+| `64ef8026c7bc` | Coordinated framework/Linux window-placement API migration |
+| `8e474e159887` | No change needed: local renderer already passes premultiplied-alpha state through uniforms |
+
+WGPU was compared from the pinned `cddb2f5d80dc0009b2ef6767635140cacf90a007`
+to `bceb82ba1d7fa61dfe0afab3a26514c6367cab93` (268 commits). Selected candidates
+are Vulkan descriptor-pool recovery (`573944a9712a`) and upload barrier coalescing
+(`2edafa5240fd`). Do not advance the pin mechanically: `a979c33dcd6d` changes
+`Queue::submit` to return `Option<SubmissionIndex>`, and buffer mapping changes
+include `f4455f178d83`. Submission completion/resource retirement and readback
+must migrate together, with Naga kept on the same revision. The free-chunk
+discard API (`c0c938bb0bd6`) is not a direct local improvement: the maintained
+renderer does not use WGPU's StagingBelt. No WGPU dependency update was adopted.
 
 The WGPU migration changes presentation and mapped-buffer APIs, including local
 material uploads and readback. Consumers must update their lockfile when adopting
@@ -147,13 +178,13 @@ make lint
 make test
 ```
 
-Build outputs default to `.cache/target`. Both crates intentionally retain
-separate regression workspaces; there is no root Cargo workspace. Their lockfiles
-are committed.
+Build outputs default to `.cache/target`. All four crates share the root Cargo
+workspace and committed `Cargo.lock`; the former per-crate lockfiles are removed.
+Existing `--manifest-path crates/<crate>/Cargo.toml` commands use this workspace.
 
-`make lint` checks formatting for both standalone crate roots, then runs Clippy
-with all targets and features. Clippy may emit warnings; a successful command is
-not a warning-free result.
+`make lint` checks workspace formatting, then runs Clippy for all members, targets
+and features. Clippy may emit warnings; a successful command is not a warning-free
+result. `make test` runs each crate's library tests, including Linux platform tests.
 
 For focused checks:
 
@@ -163,11 +194,19 @@ CARGO_TARGET_DIR=.cache/target cargo test --locked --manifest-path crates/gpui/C
 CARGO_TARGET_DIR=.cache/target cargo test --locked --manifest-path crates/gpui_wgpu/Cargo.toml --lib
 ```
 
-Consumers must patch both `gpui` and `gpui_wgpu` at the application workspace root
-and keep other Zed crates on the baseline revision. This repository's nested
-manifest patches apply only to its standalone regression workspaces; they do not
-propagate into consumers. Keep any required third-party patches, including Zed's
-nonblocking `calloop` revision, in the consuming application's root manifest.
+Consumers must patch `gpui`, `gpui_wgpu`, `gpui_linux` and `gpui_platform` at the
+application workspace root to the same repository commit, keeping other Zed crates
+on the baseline revision. These workspace patches do not propagate into consumers.
+The dependency direction remains platform constructors to Linux adapters to the
+framework/renderer; GPUI does not acquire a runtime dependency on its platform
+adapter. Keep any required third-party patches, including Zed's nonblocking
+`calloop` revision, in the consuming application's root manifest.
+
+The platform import preserves AccessKit, portal and credential integration and all
+existing target branches/features; it does not upgrade their dependencies or
+advance the Zed baseline. Future incompatible AccessKit changes must coordinate
+framework types with platform adapters. Non-Linux platform branches are retained
+but are not certified by Linux-only checks.
 
 Apache-2.0 applies to the imported crates. Font fixtures retain the licenses in
 their respective directories.

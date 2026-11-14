@@ -1,0 +1,135 @@
+# Pinned Zed df48a139ce9c292738b523252c12f044697e673f; platform source imported unchanged.
+
+
+["package"]
+"name" = "gpui_platform"
+"version" = "0.1.0"
+"edition" = "2024"
+"publish" = false
+"license" = "Apache-2.0"
+
+["lints"]
+
+["lints"."rust"]
+
+["lints"."rust"."unexpected_cfgs"]
+"level" = "allow"
+
+["lints"."clippy"]
+"dbg_macro" = "deny"
+"todo" = "deny"
+"declare_interior_mutable_const" = "deny"
+"redundant_clone" = "deny"
+"disallowed_methods" = "deny"
+"type_complexity" = "allow"
+"let_underscore_future" = "allow"
+"single_range_in_vec_init" = "allow"
+"too_many_arguments" = "allow"
+"large_enum_variant" = "allow"
+"nonminimal_bool" = "allow"
+
+["lints"."clippy"."style"]
+"level" = "allow"
+"priority" = -1
+
+["lib"]
+"path" = "src/gpui_platform.rs"
+"doctest" = false
+
+["features"]
+"default" = ["multithreaded"]
+"multithreaded" = ["gpui_web/multithreaded"]
+"bench-support" = ["gpui/bench-support", "gpui_macos/bench-support", "gpui_wgpu/bench-support"]
+"font-kit" = ["gpui_macos/font-kit"]
+"inspector" = ["gpui/inspector"]
+"test-support" = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support", "gpui_wgpu/test-support"]
+"screen-capture" = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
+"runtime_shaders" = ["gpui_macos/runtime_shaders"]
+"wayland" = ["gpui_linux/wayland"]
+"x11" = ["gpui_linux/x11"]
+
+[["bench"]]
+"name" = "inspector_render"
+"harness" = false
+"required-features" = ["bench-support"]
+
+[["bench"]]
+"name" = "randomized_element_tree"
+"harness" = false
+"required-features" = ["bench-support"]
+
+["dependencies"]
+
+["dependencies"."anyhow"]
+"version" = "1.0.86"
+
+["dependencies"."gpui"]
+"default-features" = false
+"git" = "https://github.com/zed-industries/zed"
+"rev" = "df48a139ce9c292738b523252c12f044697e673f"
+
+["dev-dependencies"]
+
+["dev-dependencies"."bench_metrics"]
+"git" = "https://github.com/zed-industries/zed"
+"rev" = "df48a139ce9c292738b523252c12f044697e673f"
+
+["dev-dependencies"."criterion"]
+"version" = "0.8.2"
+"features" = ["html_reports"]
+
+["target"]
+
+["target"."cfg(target_os = \"macos\")"]
+
+["target"."cfg(target_os = \"macos\")"."dependencies"]
+
+["target"."cfg(target_os = \"macos\")"."dependencies"."gpui_macos"]
+"default-features" = false
+"git" = "https://github.com/zed-industries/zed"
+"rev" = "df48a139ce9c292738b523252c12f044697e673f"
+
+["target"."cfg(target_os = \"windows\")"]
+
+["target"."cfg(target_os = \"windows\")"."dependencies"]
+
+["target"."cfg(target_os = \"windows\")"."dependencies"."gpui_windows"]
+"default-features" = false
+"git" = "https://github.com/zed-industries/zed"
+"rev" = "df48a139ce9c292738b523252c12f044697e673f"
+
+["target"."cfg(target_os = \"windows\")"."dependencies"."gpui"]
+"default-features" = false
+"git" = "https://github.com/zed-industries/zed"
+"rev" = "df48a139ce9c292738b523252c12f044697e673f"
+"features" = ["windows-manifest"]
+
+["target"."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))"]
+
+["target"."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))"."dependencies"]
+
+["target"."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))"."dependencies"."gpui_linux"]
+"default-features" = false
+"git" = "https://github.com/zed-industries/zed"
+"rev" = "df48a139ce9c292738b523252c12f044697e673f"
+
+["target"."cfg(target_os = \"linux\")"]
+
+["target"."cfg(target_os = \"linux\")"."dependencies"]
+
+["target"."cfg(target_os = \"linux\")"."dependencies"."gpui_wgpu"]
+"git" = "https://github.com/zed-industries/zed"
+"rev" = "df48a139ce9c292738b523252c12f044697e673f"
+"optional" = true
+
+["target"."cfg(target_family = \"wasm\")"]
+
+["target"."cfg(target_family = \"wasm\")"."dependencies"]
+
+["target"."cfg(target_family = \"wasm\")"."dependencies"."gpui_web"]
+"default-features" = false
+"git" = "https://github.com/zed-industries/zed"
+"rev" = "df48a139ce9c292738b523252c12f044697e673f"
+
+["target"."cfg(target_family = \"wasm\")"."dependencies"."console_error_panic_hook"]
+"version" = "0.1.7"
