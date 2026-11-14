@@ -75,12 +75,17 @@ where
                     return;
                 };
 
+                // The callback may own subscriptions to this same set; drop it only
+                // after releasing the borrow so their unsubscribe can borrow again.
+                let mut removed = None;
                 if let Some(subscribers) = subscribers {
-                    subscribers.remove(&subscriber_id);
+                    removed = subscribers.remove(&subscriber_id);
                     if subscribers.is_empty() {
                         lock.subscribers.remove(&emitter_key);
                     }
                 }
+                drop(lock);
+                drop(removed);
             })),
         };
         (subscription, move || active.set(true))
@@ -347,5 +352,33 @@ mod tests {
 
         app.update(|cx| cx.set_global(TestGlobal));
         assert_eq!(count.get(), 0, "should not fire after drop");
+    }
+
+    #[test]
+    fn dropping_a_callback_that_owns_a_sibling_subscription() {
+        struct GlobalA;
+        impl Global for GlobalA {}
+        struct GlobalB;
+        impl Global for GlobalB {}
+
+        let mut app = TestApp::new();
+        app.set_global(GlobalA);
+        app.set_global(GlobalB);
+
+        let b_count = Rc::new(Cell::new(0usize));
+        // Both observers live in the same `global_observers` set.
+        let sub_b = app.update({
+            let count = b_count.clone();
+            move |cx| cx.observe_global::<GlobalB>(move |_| count.set(count.get() + 1))
+        });
+        let sub_a = app.update(move |cx| {
+            cx.observe_global::<GlobalA>(move |_| {
+                let _ = &sub_b;
+            })
+        });
+
+        drop(sub_a);
+        app.update(|cx| cx.set_global(GlobalB));
+        assert_eq!(b_count.get(), 0, "owned subscription survived its owner");
     }
 }
