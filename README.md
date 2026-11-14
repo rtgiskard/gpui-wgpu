@@ -126,11 +126,11 @@ Linux and renderer patches. Adoption and remaining candidates are recorded below
 
 | Upstream commits | Disposition |
 | --- | --- |
-| `985bbf42e684` | Prioritize combining-mark positioning: local CosmicTextSystem still ignores glyph x/y offsets |
+| `985bbf42e684` | Apply cosmic-text glyph x/y offsets when building ShapedGlyph positions, preserving mark placement |
 | `decd2399b180` | Capture cached/deferred paint reads and restore live subscriptions; isolate nested window construction/draw contexts while retaining local replay ownership |
 | `bfcd5949ff82` | Prioritize Wayland callback receipt timing; local baseline still assumes a monotonic protocol timestamp |
 | `c7bea343838f`, `78fde14d124d` | Review drag cursor precedence and list horizontal padding with application layout/input acceptance |
-| `4023e3c88e0a`, `22580c6e6970`, `ddb90e5e89d3`, `62682ebde9e7` | Text/focus work reduction candidates; retain local window-thread caches and font-run scratch |
+| `4023e3c88e0a`, `22580c6e6970`, `ddb90e5e89d3`, `62682ebde9e7` | Acquire wrappers only for truncation, skip absent backgrounds, share empty features, avoid copied cache-hit text and sort tab stops lazily; preserve local window-thread caches, replay and font-run scratch |
 | `415d310e5260` | Requires coordinating the external gpui_shared_string crate, not just the four maintained crates |
 | `ba490197cfb8`, `caead827d77c`, `ffe0fa29e41e`, `1d8eda94bd4d`, `be07e43ea0ad`, `d3fc053d5b62` | Separate rendering migration: clipping, paths, batching, depth and sorting interact with local materials, scene filters and replay |
 | `aff99ecc3249` | Separate retained SVG-animation migration; preserve local transformed-sprite/replay contracts |

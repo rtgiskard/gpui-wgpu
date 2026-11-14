@@ -799,6 +799,13 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    // All background entry points share this guard, before bounds, layers or glyph work.
+    if !decoration_runs
+        .iter()
+        .any(|run| run.background_color.is_some())
+    {
+        return Ok(());
+    }
     let line_bounds = line_paint_bounds(
         origin,
         layout,
@@ -1114,7 +1121,7 @@ mod tests {
 
     #[gpui::test]
     fn test_underline_handler_matches_default_paint(cx: &mut TestAppContext) {
-        test_underline_handler_at_scales(cx, |window, cx| {
+        test_line_paint_at_scales(cx, |window, cx| {
             let first_style = UnderlineStyle {
                 thickness: px(1.),
                 color: Some(hsla(0., 1., 0.5, 1.)),
@@ -1262,7 +1269,7 @@ mod tests {
 
     #[gpui::test]
     fn test_underline_handler_reports_zero_advance_geometry(cx: &mut TestAppContext) {
-        test_underline_handler_at_scales(cx, |window, cx| {
+        test_line_paint_at_scales(cx, |window, cx| {
             let first_style = UnderlineStyle {
                 thickness: px(1.),
                 color: Some(black()),
@@ -1341,7 +1348,7 @@ mod tests {
 
     #[gpui::test]
     fn test_underline_handler_matches_wrapped_paint(cx: &mut TestAppContext) {
-        test_underline_handler_at_scales(cx, |window, cx| {
+        test_line_paint_at_scales(cx, |window, cx| {
             let style = UnderlineStyle {
                 thickness: px(1.),
                 color: Some(black()),
@@ -1418,6 +1425,82 @@ mod tests {
                     ]
                 );
                 assert_underline_primitives_eq(&window.next_frame.scene.underlines, &original);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn background_paint_skips_layers_without_backgrounds(cx: &mut TestAppContext) {
+        test_line_paint_at_scales(cx, |window, cx| {
+            let decoration = DecorationRun {
+                len: 2,
+                color: black(),
+                background_color: None,
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: None,
+                    wavy: false,
+                }),
+                strikethrough: None,
+            };
+            let mut line =
+                underline_test_line("abcd", &[decoration.clone(), decoration], false, window);
+            let origin = point(px(10.), px(20.));
+            let line_height = px(20.);
+            for background in [None, Some(hsla(0., 1., 0.5, 1.))] {
+                // The first run never has a background; later runs must still paint.
+                line.decoration_runs[1].background_color = background;
+                let wrapped = WrappedLine {
+                    layout: Arc::new(WrappedLineLayout {
+                        unwrapped_layout: line.layout.clone(),
+                        wrap_boundaries: smallvec::smallvec![WrapBoundary {
+                            run_ix: 0,
+                            glyph_ix: 2,
+                        }],
+                        wrap_width: Some(px(16.)),
+                    }),
+                    decoration_runs: line.decoration_runs.to_vec(),
+                    text: line.text.clone(),
+                };
+                for entry in 0..3 {
+                    let operations_before = window.next_frame.scene.len();
+                    let quads_before = window.next_frame.scene.quads.len();
+                    match entry {
+                        0 => line.paint_background(
+                            origin,
+                            line_height,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        ),
+                        1 => line.layout.paint_background(
+                            origin,
+                            line_height,
+                            TextAlign::Left,
+                            None,
+                            &line.decoration_runs,
+                            window,
+                            cx,
+                        ),
+                        _ => wrapped.paint_background(
+                            origin,
+                            line_height,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        ),
+                    }
+                    .unwrap();
+                    if background.is_none() {
+                        assert_eq!(window.next_frame.scene.len(), operations_before);
+                        assert_eq!(window.next_frame.scene.quads.len(), quads_before);
+                    } else {
+                        assert!(window.next_frame.scene.len() > operations_before);
+                        assert_eq!(window.next_frame.scene.quads.len(), quads_before + 1);
+                    }
+                }
             }
         });
     }
@@ -1646,9 +1729,9 @@ mod tests {
         assert_eq!(right.decoration_runs[1].color, blue);
     }
 
-    struct UnderlineHandlerTestView(Rc<dyn Fn(&mut Window, &mut App)>);
+    struct LinePaintTestView(Rc<dyn Fn(&mut Window, &mut App)>);
 
-    impl Render for UnderlineHandlerTestView {
+    impl Render for LinePaintTestView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let paint = self.0.clone();
             canvas(
@@ -1661,11 +1744,11 @@ mod tests {
         }
     }
 
-    fn test_underline_handler_at_scales(
+    fn test_line_paint_at_scales(
         cx: &mut TestAppContext,
         paint: impl Fn(&mut Window, &mut App) + 'static,
     ) {
-        let window = cx.add_window(move |_, _| UnderlineHandlerTestView(Rc::new(paint)));
+        let window = cx.add_window(move |_, _| LinePaintTestView(Rc::new(paint)));
         for scale in [1., 1.25, 1.5, 2., 3.] {
             cx.simulate_window_scale_factor_change(window.into(), scale);
             cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))

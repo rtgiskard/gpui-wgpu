@@ -696,11 +696,13 @@ impl TextLayout {
                     return size;
                 }
 
-                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
+                    // Only paths that actually truncate need a pooled wrapper.
                     if let Some(max_lines) = text_style.line_clamp
                         && let Some(wrap_width) = wrap_width
                     {
+                        let mut line_wrapper =
+                            cx.text_system().line_wrapper(text_style.font(), font_size);
                         line_wrapper.truncate_wrapped_line(
                             text.clone(),
                             wrap_width,
@@ -725,6 +727,8 @@ impl TextLayout {
                         // already measured untruncated this frame.
                         (text.clone(), Cow::Borrowed(&*runs))
                     } else {
+                        let mut line_wrapper =
+                            cx.text_system().line_wrapper(text_style.font(), font_size);
                         line_wrapper.truncate_line(
                             text.clone(),
                             truncate_width,

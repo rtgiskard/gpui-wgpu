@@ -5264,11 +5264,12 @@ impl Window {
         if self.isolated_paint_depth != 0 {
             return false;
         }
-        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
+        // Capability is cheap; some platforms lock to query background appearance.
+        if !self.platform_window.is_subpixel_rendering_supported() {
             return false;
         }
 
-        if !self.platform_window.is_subpixel_rendering_supported() {
+        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
 
