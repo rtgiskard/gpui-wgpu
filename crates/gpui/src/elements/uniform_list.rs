@@ -421,7 +421,12 @@ impl Element for UniformList {
                     }) = shared_scroll_to_item
                     {
                         if y_flipped {
-                            item_index = self.item_count.saturating_sub(item_index + 1);
+                            item_index = match item_index.checked_add(1) {
+                                Some(end) => self.item_count.saturating_sub(end),
+                                // `scroll_to_bottom`'s `usize::MAX` means the visual bottom,
+                                // which a flipped list renders as its last row.
+                                None => self.item_count.saturating_sub(1),
+                            };
                         }
                         let list_height = padded_bounds.size.height;
                         let mut updated_scroll_offset = shared_scroll_offset.borrow_mut();
@@ -865,6 +870,54 @@ mod test {
                 assert_eq!(view.visible_range, ix..ix + 10);
             })
         }
+    }
+
+    #[gpui::test]
+    fn flipped_scroll_to_bottom_reaches_the_visual_bottom(cx: &mut TestAppContext) {
+        use crate::{
+            Context, ScrollStrategy, UniformListScrollHandle, Window, div, prelude::*, px,
+            uniform_list,
+        };
+        use std::ops::Range;
+
+        struct TestView {
+            scroll_handle: UniformListScrollHandle,
+            rendered: Range<usize>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                uniform_list(
+                    "entries",
+                    47,
+                    cx.processor(|this, range: Range<usize>, _, _| {
+                        this.rendered = range.clone();
+                        range.map(|ix| div().id(ix).h(px(20.0))).collect()
+                    }),
+                )
+                .track_scroll(&self.scroll_handle)
+                .y_flipped(true)
+                .h(px(200.0))
+            }
+        }
+
+        let (view, cx) = cx.add_window_view(|_, _| TestView {
+            scroll_handle: UniformListScrollHandle::new(),
+            rendered: 0..0,
+        });
+        // Item 0 is at the visual bottom. Scroll away from it, then back.
+        view.update_in(cx, |view, window, _| {
+            view.scroll_handle.scroll_to_item(46, ScrollStrategy::Top);
+            window.refresh();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.rendered, 37..47));
+        view.update_in(cx, |view, window, _| {
+            view.scroll_handle.scroll_to_bottom();
+            window.refresh();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.rendered, 0..10));
     }
 
     #[gpui::test]
