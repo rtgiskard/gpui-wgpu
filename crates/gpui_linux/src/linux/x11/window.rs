@@ -645,12 +645,10 @@ impl X11WindowState {
                 }
             }
 
-            let parent = if params.kind == WindowKind::Dialog
-                && let Some(parent) = parent_window
-            {
-                parent.add_child(x_window);
-
-                Some(parent)
+            // The parent learns about this child in `X11Window::new`, once construction can no
+            // longer fail: a registered child blocks all input to the parent.
+            let parent = if params.kind == WindowKind::Dialog {
+                parent_window
             } else {
                 None
             };
@@ -962,6 +960,11 @@ impl X11Window {
 
         let state = ptr.state.borrow_mut();
         ptr.set_wm_properties(state)?;
+
+        let parent = ptr.state.borrow().parent.clone();
+        if let Some(parent) = parent {
+            parent.add_child(x_window);
+        }
 
         Ok(Self(ptr))
     }
