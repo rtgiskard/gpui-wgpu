@@ -10,19 +10,21 @@ Actions are similar to framework-level events like `MouseDown`, `KeyDown`, etc, 
 
 ```rust
 mod menu {
-    #[gpui::action]
+    #[derive(Clone, PartialEq, Default, gpui::Action)]
+    #[action(namespace = menu, no_json)]
     struct MoveUp;
 
-    #[gpui::action]
+    #[derive(Clone, PartialEq, Default, gpui::Action)]
+    #[action(namespace = menu, no_json)]
     struct MoveDown;
 }
 ```
 
-Actions are frequently unit structs, for which we have a macro. The above could also be written:
+For unit actions with JSON keymap support, use the macro:
 
 ```rust
 mod menu {
-    actions!(gpui, [MoveUp, MoveDown]);
+    gpui::actions!(menu, [MoveUp, MoveDown]);
 }
 ```
 
@@ -30,7 +32,8 @@ Actions can also be more complex types:
 
 ```rust
 mod menu {
-    #[gpui::action]
+    #[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+    #[action(namespace = menu)]
     struct Move {
         direction: Direction,
         select: bool,
@@ -44,12 +47,12 @@ To bind actions, chain `on_action` on to your element:
 impl Render for Menu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .on_action(|this: &mut Menu, move: &MoveUp, window: &mut Window, cx: &mut Context<Menu>| {
+            .on_action(cx.listener(|this: &mut Menu, action: &MoveUp, window, cx| {
                 // ...
-            })
-            .on_action(|this, move: &MoveDown, cx| {
+            }))
+            .on_action(cx.listener(|this, action: &MoveDown, window, cx| {
                 // ...
-            })
+            }))
             .children(unimplemented!())
     }
 }
@@ -62,18 +65,20 @@ impl Render for Menu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("menu")
-            .on_action(|this: &mut Menu, move: &MoveUp, window: &mut Window, cx: &mut Context<Menu>| {
+            .on_action(cx.listener(|this: &mut Menu, action: &MoveUp, window, cx| {
                 // ...
-            })
-            .on_action(|this, move: &MoveDown, cx| {
+            }))
+            .on_action(cx.listener(|this, action: &MoveDown, window, cx| {
                 // ...
-            })
+            }))
             .children(unimplemented!())
     }
 }
 ```
 
-Now you can target your context in the keymap. Note how actions are identified in the keymap by their fully-qualified type name.
+Register standalone application bindings with `App::bind_keys` and `KeyBinding::new`.
+The following JSON is the host application's keymap representation (as used by Zed),
+not a file that GPUI loads automatically. Action names use the declared namespace.
 
 ```json
 {
@@ -91,10 +96,10 @@ If you had opted for the more complex type definition, you'd provide the seriali
 {
   "context": "menu",
   "bindings": {
-    "up": ["menu::Move", {direction: "up", select: false}]
-    "down": ["menu::Move", {direction: "down", select: false}]
-    "shift-up": ["menu::Move", {direction: "up", select: true}]
-    "shift-down": ["menu::Move", {direction: "down", select: true}]
+    "up": ["menu::Move", {"direction": "up", "select": false}],
+    "down": ["menu::Move", {"direction": "down", "select": false}],
+    "shift-up": ["menu::Move", {"direction": "up", "select": true}],
+    "shift-down": ["menu::Move", {"direction": "down", "select": true}]
   }
 }
 ```

@@ -26,7 +26,7 @@ These are similar to the async contexts above, but they panic if you attempt to 
 
 ## `Window`
 
-Provides access to the state of an application window. This type has a root view (an `Entity` implementing `Render`) which it can read/update, but since it is not a context, you must pass a `&mut App` (or a context which dereferences to it) to do so, along with other functions interacting with global state. You can obtain a `Window` from an `WindowHandle` by calling `WindowHandle::update`.
+Provides access to the state of an application window. This type has a root view (an `Entity` implementing `Render`) which it can read/update, but since it is not a context, you must pass a `&mut App` (or a context which dereferences to it) to do so, along with other functions interacting with global state. Use `WindowHandle::update` to access the window through a callback.
 
 ## `Entity<T>`
 
