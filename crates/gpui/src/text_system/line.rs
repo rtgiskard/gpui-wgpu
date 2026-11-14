@@ -183,10 +183,8 @@ impl ShapedLine {
 
     /// Split this shaped line at a byte index, returning `(prefix, suffix)`.
     ///
-    /// - `prefix` contains glyphs for bytes `[0, byte_index)` with original positions.
-    ///   Its width equals the x-advance up to the split point.
-    /// - `suffix` contains glyphs for bytes `[byte_index, len)` with positions
-    ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
+    /// - Glyphs are partitioned as in [`LineLayout::split_at`], and the suffix's byte
+    ///   indices are rebased to 0.
     /// - Decoration runs are partitioned at the boundary; a run that straddles it is
     ///   split into two with adjusted lengths.
     /// - `font_size`, `ascent`, and `descent` are copied to both halves.
@@ -1917,6 +1915,22 @@ mod tests {
             assert_eq!(cursor.x_offset(), line.x_for_index(boundary));
             remainder = rest;
             previous_boundary = boundary;
+        }
+    }
+
+    #[test]
+    fn test_cursor_splits_right_to_left_line_by_bytes() {
+        // Right-to-left "abc": visual order c b a with advances 7, 12, 11.
+        let line = make_shaped_line("abc", &[(2, 0.0), (1, 7.0), (0, 19.0)], 30.0, &[]);
+        let mut cursor = line.cursor();
+        for (boundary, text, width) in [(1, "a", 11.0), (2, "b", 12.0), (3, "c", 7.0)] {
+            let piece = cursor.take_until(boundary);
+            assert_eq!(piece.text.as_ref(), text);
+            assert_eq!(piece.width(), px(width));
+            assert_eq!(piece.runs.len(), 1);
+            assert_eq!(piece.runs[0].glyphs.len(), 1);
+            assert_eq!(piece.runs[0].glyphs[0].index, 0);
+            assert_eq!(piece.runs[0].glyphs[0].position.x, px(0.0));
         }
     }
 

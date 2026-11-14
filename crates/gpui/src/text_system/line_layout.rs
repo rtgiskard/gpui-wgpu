@@ -130,62 +130,100 @@ impl LineLayout {
 
     /// Split this layout at a byte index, returning `(prefix, suffix)`.
     ///
-    /// - `prefix` contains glyphs for bytes `[0, byte_index)` with original positions.
-    ///   Its width equals the x-advance up to the split point.
-    /// - `suffix` contains glyphs for bytes `[byte_index, len)` with positions
-    ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
+    /// - `prefix` contains glyphs for bytes `[0, byte_index)`; `suffix` contains glyphs
+    ///   for bytes `[byte_index, len)` with byte indices rebased to 0.
+    /// - Byte-ordered glyphs keep their original positions in `prefix`, whose width ends
+    ///   at the split point's x; `suffix` is shifted left by that x.
+    /// - Otherwise (bidirectional text) each half keeps its glyphs' left-to-right order and
+    ///   advances, packed from x=0. Either way the widths sum to the original width.
     /// - `font_size`, `ascent`, and `descent` are copied to both halves.
     pub fn split_at(&self, byte_index: usize) -> (LineLayout, LineLayout) {
-        let x_offset = self.x_for_index(byte_index);
+        let empty_half = |len| LineLayout {
+            font_size: self.font_size,
+            width: px(0.),
+            ascent: self.ascent,
+            descent: self.descent,
+            runs: Vec::new(),
+            len,
+        };
+        let mut left = empty_half(byte_index);
+        let mut right = empty_half(self.len - byte_index);
 
-        // Partition glyph runs. A single run may contribute glyphs to both halves.
-        let mut left_runs = Vec::new();
-        let mut right_runs = Vec::new();
-
-        for run in &self.runs {
-            let split_pos = run.glyphs.partition_point(|g| g.index < byte_index);
-
-            if split_pos > 0 {
-                left_runs.push(ShapedRun {
-                    font_id: run.font_id,
-                    glyphs: run.glyphs[..split_pos].to_vec(),
-                });
+        let mut new_x: Vec<Vec<Pixels>> = self
+            .runs
+            .iter()
+            .map(|run| run.glyphs.iter().map(|glyph| glyph.position.x).collect())
+            .collect();
+        let byte_ordered = self
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+            .is_sorted();
+        if byte_ordered {
+            // Glyph offsets may break x order, so cut at the split glyph's x, not by advances.
+            let split_x = self.x_for_index(byte_index);
+            for (run, new_x) in self.runs.iter().zip(&mut new_x) {
+                for (glyph, x) in run.glyphs.iter().zip(new_x) {
+                    if glyph.index >= byte_index {
+                        *x -= split_x;
+                    }
+                }
             }
+            left.width = split_x;
+            right.width = self.width - split_x;
+        } else {
+            // Runs list right-to-left glyphs from right to left, so visit glyphs by x. A
+            // glyph's advance extends to the next glyph to its right (or the line's end), and
+            // the gap before the leftmost glyph belongs to the prefix. Each half lays its
+            // glyphs out at its own running width, keeping every advance.
+            let mut by_x: Vec<(usize, usize)> = self
+                .runs
+                .iter()
+                .enumerate()
+                .flat_map(|(run_ix, run)| (0..run.glyphs.len()).map(move |ix| (run_ix, ix)))
+                .collect();
+            let x_of = |&(run_ix, ix): &(usize, usize)| self.runs[run_ix].glyphs[ix].position.x;
+            by_x.sort_by(|a, b| x_of(a).0.total_cmp(&x_of(b).0));
 
-            if split_pos < run.glyphs.len() {
-                let right_glyphs = run.glyphs[split_pos..]
-                    .iter()
-                    .map(|g| ShapedGlyph {
-                        id: g.id,
-                        position: point(g.position.x - x_offset, g.position.y),
-                        index: g.index - byte_index,
-                        is_emoji: g.is_emoji,
-                    })
-                    .collect();
-                right_runs.push(ShapedRun {
-                    font_id: run.font_id,
-                    glyphs: right_glyphs,
-                });
+            left.width = by_x.first().map_or(self.width, x_of);
+            for (order, glyph) in by_x.iter().enumerate() {
+                let next_x = by_x.get(order + 1).map_or(self.width, x_of);
+                let (run_ix, ix) = *glyph;
+                let half = if self.runs[run_ix].glyphs[ix].index < byte_index {
+                    &mut left
+                } else {
+                    &mut right
+                };
+                new_x[run_ix][ix] = half.width;
+                half.width += next_x - x_of(glyph);
             }
         }
 
-        let left = LineLayout {
-            font_size: self.font_size,
-            width: x_offset,
-            ascent: self.ascent,
-            descent: self.descent,
-            runs: left_runs,
-            len: byte_index,
-        };
-
-        let right = LineLayout {
-            font_size: self.font_size,
-            width: self.width - x_offset,
-            ascent: self.ascent,
-            descent: self.descent,
-            runs: right_runs,
-            len: self.len - byte_index,
-        };
+        for (run, new_x) in self.runs.iter().zip(new_x) {
+            let mut left_glyphs = Vec::new();
+            let mut right_glyphs = Vec::new();
+            for (glyph, x) in run.glyphs.iter().zip(new_x) {
+                let (glyphs, index_base) = if glyph.index < byte_index {
+                    (&mut left_glyphs, 0)
+                } else {
+                    (&mut right_glyphs, byte_index)
+                };
+                glyphs.push(ShapedGlyph {
+                    id: glyph.id,
+                    position: point(x, glyph.position.y),
+                    index: glyph.index - index_base,
+                    is_emoji: glyph.is_emoji,
+                });
+            }
+            for (half, glyphs) in [(&mut left, left_glyphs), (&mut right, right_glyphs)] {
+                if !glyphs.is_empty() {
+                    half.runs.push(ShapedRun {
+                        font_id: run.font_id,
+                        glyphs,
+                    });
+                }
+            }
+        }
 
         (left, right)
     }
@@ -1157,5 +1195,178 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    /// Builds a layout whose runs use their position as font id; glyphs are `(byte index, x)`.
+    fn split_test_layout(width: f32, len: usize, runs: &[&[(usize, f32)]]) -> LineLayout {
+        LineLayout {
+            font_size: px(16.),
+            width: px(width),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: runs
+                .iter()
+                .enumerate()
+                .map(|(font, glyphs)| ShapedRun {
+                    font_id: FontId(font),
+                    glyphs: glyphs
+                        .iter()
+                        .map(|&(index, x)| glyph_at(x, index))
+                        .collect(),
+                })
+                .collect(),
+            len,
+        }
+    }
+
+    fn split_runs(layout: &LineLayout) -> Vec<(FontId, Vec<(usize, f32)>)> {
+        layout
+            .runs
+            .iter()
+            .map(|run| {
+                let glyphs = run
+                    .glyphs
+                    .iter()
+                    .map(|g| (g.index, f32::from(g.position.x)))
+                    .collect();
+                (run.font_id, glyphs)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_split_at_partitions_rtl_glyphs_by_byte_side() {
+        // Right-to-left "abcd": visual order d c b a with advances 10, 15, 5, 12.
+        let layout = split_test_layout(42., 4, &[&[(3, 0.), (2, 10.), (1, 25.), (0, 30.)]]);
+
+        let (left, right) = layout.split_at(2);
+        assert_eq!(split_runs(&left), vec![(FontId(0), vec![(1, 0.), (0, 5.)])]);
+        assert_eq!(left.width, px(17.));
+        assert_eq!(left.len, 2);
+        assert_eq!(
+            split_runs(&right),
+            vec![(FontId(0), vec![(1, 0.), (0, 10.)])]
+        );
+        assert_eq!(right.width, px(25.));
+        assert_eq!(right.len, 2);
+
+        for byte_index in 0..=layout.len {
+            let (left, right) = layout.split_at(byte_index);
+            assert_eq!(left.width + right.width, layout.width, "split={byte_index}");
+            let mut glyph_count = 0;
+            for half in [&left, &right] {
+                for glyph in half.runs.iter().flat_map(|run| &run.glyphs) {
+                    assert!(glyph.index < half.len, "split={byte_index}");
+                    assert!(glyph.position.x >= px(0.), "split={byte_index}");
+                    assert!(glyph.position.x < half.width, "split={byte_index}");
+                    glyph_count += 1;
+                }
+            }
+            assert_eq!(glyph_count, 4, "split={byte_index}");
+        }
+    }
+
+    #[test]
+    fn test_split_at_follows_positions_when_glyphs_are_listed_right_to_left() {
+        // An RTL paragraph "Xab" (X two bytes) as cosmic-text emits it: glyphs listed from
+        // the right edge leftward. X sits rightmost; "ab" stays left-to-right inside it.
+        // Advances by position: a 10, b 6, X 14.
+        let layout = split_test_layout(30., 4, &[&[(0, 16.), (3, 10.), (2, 0.)]]);
+
+        let (left, right) = layout.split_at(3);
+        assert_eq!(
+            split_runs(&left),
+            vec![(FontId(0), vec![(0, 10.), (2, 0.)])]
+        );
+        assert_eq!(left.width, px(24.));
+        assert_eq!(split_runs(&right), vec![(FontId(0), vec![(0, 0.)])]);
+        assert_eq!(right.width, px(6.));
+
+        for byte_index in [0, 2, 3, 4] {
+            let (left, right) = layout.split_at(byte_index);
+            assert_eq!(left.width + right.width, layout.width, "split={byte_index}");
+            for half in [&left, &right] {
+                assert!(half.width >= px(0.), "split={byte_index}");
+                for glyph in half.runs.iter().flat_map(|run| &run.glyphs) {
+                    assert!(glyph.position.x < half.width, "split={byte_index}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_split_at_packs_mixed_direction_segments() {
+        // "abCDEf" with right-to-left "CDE": visual order a b E D C f across two font runs,
+        // with advances 8, 12, 6, 14, 7, 13. Splitting at byte 3 interleaves the halves.
+        let layout = split_test_layout(
+            60.,
+            6,
+            &[
+                &[(0, 0.), (1, 8.), (4, 20.)],
+                &[(3, 26.), (2, 40.), (5, 47.)],
+            ],
+        );
+
+        let (left, right) = layout.split_at(3);
+        assert_eq!(
+            split_runs(&left),
+            vec![
+                (FontId(0), vec![(0, 0.), (1, 8.)]),
+                (FontId(1), vec![(2, 20.)]),
+            ]
+        );
+        assert_eq!(left.width, px(27.));
+        assert_eq!(
+            split_runs(&right),
+            vec![
+                (FontId(0), vec![(1, 0.)]),
+                (FontId(1), vec![(0, 6.), (2, 20.)]),
+            ]
+        );
+        assert_eq!(right.width, px(33.));
+    }
+
+    #[test]
+    fn test_split_at_byte_ordered_glyphs_cut_at_split_x() {
+        // Leading gap, a combining mark sharing byte 1 offset left of its base (so x order
+        // differs from byte order), a multi-byte character at bytes 1..4, and a font run
+        // boundary.
+        let layout = split_test_layout(
+            41.5,
+            7,
+            &[
+                &[(0, 2.5), (1, 11.), (1, 9.25), (4, 17.75)],
+                &[(5, 30.125), (6, 36.)],
+            ],
+        );
+
+        for byte_index in 0..=layout.len {
+            let split_x = layout.x_for_index(byte_index);
+            let mut expected_left = Vec::new();
+            let mut expected_right = Vec::new();
+            for (font_id, glyphs) in split_runs(&layout) {
+                let (before, after): (Vec<_>, Vec<_>) = glyphs
+                    .into_iter()
+                    .partition(|&(index, _)| index < byte_index);
+                if !before.is_empty() {
+                    expected_left.push((font_id, before));
+                }
+                if !after.is_empty() {
+                    let after: Vec<_> = after
+                        .into_iter()
+                        .map(|(index, x)| (index - byte_index, x - f32::from(split_x)))
+                        .collect();
+                    expected_right.push((font_id, after));
+                }
+            }
+
+            let (left, right) = layout.split_at(byte_index);
+            assert_eq!(split_runs(&left), expected_left, "split={byte_index}");
+            assert_eq!(left.width, split_x, "split={byte_index}");
+            assert_eq!(left.len, byte_index);
+            assert_eq!(split_runs(&right), expected_right, "split={byte_index}");
+            assert_eq!(right.width, layout.width - split_x, "split={byte_index}");
+            assert_eq!(right.len, layout.len - byte_index);
+        }
     }
 }
