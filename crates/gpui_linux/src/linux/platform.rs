@@ -18,12 +18,9 @@ use std::{
 use anyhow::ensure;
 use anyhow::{Context as _, anyhow};
 #[cfg(any(feature = "wayland", feature = "x11"))]
-use ashpd::{
-    desktop::{
-        Request,
-        inhibit::{InhibitFlags, InhibitOptions, InhibitProxy},
-    },
-    enumflags2::BitFlags,
+use ashpd::desktop::{
+    Request,
+    inhibit::{InhibitFlags, InhibitOptions, InhibitProxy},
 };
 use calloop::{EventLoop, LoopHandle, LoopSignal, channel::Sender};
 use futures::channel::oneshot;
@@ -1656,7 +1653,7 @@ async fn inhibit_idle_sleep(reason: String, executor: BackgroundExecutor) -> Res
     let request = proxy
         .inhibit(
             None,
-            BitFlags::from(InhibitFlags::Suspend),
+            InhibitFlags::SUSPEND,
             InhibitOptions::default().set_reason(reason.as_str()),
         )
         .await

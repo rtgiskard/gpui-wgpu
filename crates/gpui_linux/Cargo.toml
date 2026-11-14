@@ -1,4 +1,4 @@
-# Pinned Zed df48a139ce9c292738b523252c12f044697e673f; platform source imported unchanged.
+# Pinned Zed df48a139ce9c292738b523252c12f044697e673f with selected downstream fixes.
 
 
 ["package"]
@@ -126,7 +126,7 @@
 "features" = ["serde"]
 
 ["target"."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))"."dependencies"."oo7"]
-"version" = "0.6"
+"version" = "0.7.1"
 "default-features" = false
 "features" = ["async-std", "native_crypto"]
 
@@ -137,7 +137,7 @@
 "version" = "0.6"
 
 ["target"."cfg(any(target_os = \"linux\", target_os = \"freebsd\"))"."dependencies"."ashpd"]
-"version" = "0.13"
+"version" = "0.14"
 "default-features" = false
 "features" = ["async-io", "inhibit", "open_uri", "file_chooser", "settings"]
 "optional" = true

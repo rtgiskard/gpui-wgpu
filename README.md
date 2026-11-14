@@ -21,10 +21,10 @@ author dates and the material branch merge. Each patch commit names its complete
 Rivu source hash. Subjects describing application features are narrowed to the
 framework portion actually imported.
 
-The imported crate contents are unchanged from Rivu's `vendor/gpui` and
-`vendor/gpui_wgpu`. Final integration commits supply licensed font fixtures,
-standalone lockfiles and development commands. Historical dependency stages are
-validated together at the final tree; individual intermediate commits are not
+At extraction, the imported crate contents matched Rivu's `vendor/gpui` and
+`vendor/gpui_wgpu`. Final integration commits supplied licensed font fixtures,
+standalone lockfiles and development commands, later consolidated into one workspace.
+Historical dependency stages are validated together at the final tree; intermediate commits are not
 claimed to build independently. Rivu's application changes, integration tests and
 benchmark claims are not imported. No application dependency cutover is included.
 
@@ -174,16 +174,20 @@ integration remain on the pinned Zed baseline.
 
 ### Registry dependency refresh
 
-The 2026-11-14 refresh updates the workspace lockfile within existing version
-requirements, without advancing Git revisions, the exact Taffy pin or incompatible
-release lines. It replaces yanked async-executor 1.14.0 with 1.14.1 and resolves
-the certificate advisories with rustls-webpki 0.103.17 and webpki-roots /
-webpki-root-certs 1.0.12. Consumers must refresh their own lockfiles; this
-repository's lockfile does not constrain downstream resolution.
+The initial 2026-11-14 refresh updated the workspace lockfile within existing
+version requirements, without advancing Git revisions, the exact Taffy pin or
+incompatible release lines. It replaced yanked async-executor 1.14.0 with 1.14.1
+and resolved the certificate advisories with rustls-webpki 0.103.17 and
+webpki-roots / webpki-root-certs 1.0.12.
 
-notify-rust 4.19 uses zbus 6 alongside zbus 5 retained by AccessKit/AT-SPI, ashpd
-and oo7. Updating notifications alone does not remove the unmaintained
-zbus_names, zvariant and zvariant_derive crates. Remaining unmaintained paths
+The subsequent portal/keyring migration upgrades ashpd to 0.14 and oo7 to 0.7.1
+across incompatible release lines. These now use zbus 6, alongside notify-rust
+4.19, while retaining the non-Tokio runtime and native cryptography. Consumers
+must refresh their own lockfiles when adopting these changes; this repository's
+lockfile does not constrain downstream resolution.
+Idle inhibition uses ashpd's native bitflags API. AccessKit/AT-SPI remains unchanged on zbus 5,
+so zbus_names, zvariant and zvariant_derive are still present and unmaintained.
+oo7's file backend uses zgvariant. Remaining unmaintained paths
 also include cosmic-text/fontdb's ttf-parser, development HTTP support's
 rustls-pemfile and the pinned macOS renderer's metal/paste. The EXR dependency
 no longer introduces paste. These maintenance advisories are not suppressed;
@@ -227,11 +231,11 @@ framework/renderer; GPUI does not acquire a runtime dependency on its platform
 adapter. Keep any required third-party patches, including Zed's nonblocking
 `calloop` revision, in the consuming application's root manifest.
 
-The platform import preserves AccessKit, portal and credential integration and all
-existing target branches/features; it does not upgrade their dependencies or
-advance the Zed baseline. Future incompatible AccessKit changes must coordinate
-framework types with platform adapters. Non-Linux platform branches are retained
-but are not certified by Linux-only checks.
+The platform import preserved AccessKit, portal and credential integration and
+existing target branches/features. The portal/keyring dependency migration above
+does not advance the Zed baseline or change AccessKit/AT-SPI. Future incompatible
+AccessKit changes must coordinate framework types with platform adapters.
+Non-Linux platform branches are retained but are not certified by Linux-only checks.
 
 Apache-2.0 applies to the imported crates. Font fixtures retain the licenses in
 their respective directories.
