@@ -1164,12 +1164,14 @@ impl Element for InteractiveText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let current_view = window.current_view();
         let text_layout = self.text.layout().clone();
         window.with_element_state::<InteractiveTextState, _>(
             global_id.unwrap(),
             |interactive_state, window| {
                 let mut interactive_state = interactive_state.unwrap_or_default();
+                // Link cursor styling is decided during paint, so clicks also need tracking.
+                let needs_hover_tracking =
+                    self.hover_listener.is_some() || self.click_listener.is_some();
                 if let Some(click_listener) = self.click_listener.take() {
                     let mouse_position = window.mouse_position();
                     if let Ok(ix) = text_layout.index_for_position(mouse_position)
@@ -1230,25 +1232,31 @@ impl Element for InteractiveText {
                     );
                 }
 
-                window.on_mouse_event({
-                    let mut hover_listener = self.hover_listener.take();
-                    let hitbox = hitbox.clone();
-                    let text_layout = text_layout.clone();
-                    let hovered_index = interactive_state.hovered_index.clone();
-                    move |event: &MouseMoveEvent, phase, window, cx| {
-                        if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                            let current = hovered_index.get();
-                            let updated = text_layout.index_for_position(event.position).ok();
-                            if current != updated {
-                                hovered_index.set(updated);
-                                if let Some(hover_listener) = hover_listener.as_ref() {
-                                    hover_listener(updated, event.clone(), window, cx);
+                if needs_hover_tracking {
+                    let current_view = window.current_view();
+                    let hover_listener = self.hover_listener.take();
+                    window.on_mouse_event({
+                        let hitbox = hitbox.clone();
+                        let text_layout = text_layout.clone();
+                        let hovered_index = interactive_state.hovered_index.clone();
+                        move |event: &MouseMoveEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                                let current = hovered_index.get();
+                                let updated = text_layout.index_for_position(event.position).ok();
+                                if current != updated {
+                                    hovered_index.set(updated);
+                                    if let Some(hover_listener) = hover_listener.as_ref() {
+                                        hover_listener(updated, event.clone(), window, cx);
+                                    }
+                                    cx.notify(current_view);
                                 }
-                                cx.notify(current_view);
                             }
                         }
-                    }
-                });
+                    });
+                } else {
+                    // A later listener must not inherit an earlier listener's hover index.
+                    interactive_state.hovered_index.set(None);
+                }
 
                 if let Some(tooltip_builder) = self.tooltip_builder.clone() {
                     let active_tooltip = interactive_state.active_tooltip.clone();
@@ -1323,6 +1331,7 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AppContext as _;
 
     #[test]
     fn test_into_element_for() {
@@ -1352,6 +1361,218 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+
+    #[derive(Default)]
+    struct HoverText {
+        hover_enabled: bool,
+        click_enabled: bool,
+        clicks: Rc<Cell<usize>>,
+        show_tooltip: bool,
+        hovered: Rc<RefCell<Vec<Option<usize>>>>,
+        tooltip_indices: Rc<RefCell<Vec<usize>>>,
+        tooltip_rendered: Rc<Cell<bool>>,
+        layout: TextLayout,
+    }
+
+    impl crate::Render for HoverText {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            let text = StyledText::new("hello world");
+            self.layout = text.layout().clone();
+            let show_tooltip = self.show_tooltip;
+            let indices = self.tooltip_indices.clone();
+            let rendered = self.tooltip_rendered.clone();
+            let mut text = InteractiveText::new("label", text).tooltip(move |index, _, cx| {
+                indices.borrow_mut().push(index);
+                show_tooltip.then(|| cx.new(|_| HoverTextTooltip(rendered.clone())).into())
+            });
+            if self.hover_enabled {
+                let hovered = self.hovered.clone();
+                text = text.on_hover(move |index, _, _, _| hovered.borrow_mut().push(index));
+            }
+            if self.click_enabled {
+                let clicks = self.clicks.clone();
+                text = text.on_click(std::iter::once(0..5).collect(), move |_, _, _| {
+                    clicks.set(clicks.get() + 1)
+                });
+            }
+            text
+        }
+    }
+
+    struct HoverTextTooltip(Rc<Cell<bool>>);
+
+    impl crate::Render for HoverTextTooltip {
+        fn render(
+            &mut self,
+            _: &mut Window,
+            _: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            self.0.set(true);
+            "tooltip"
+        }
+    }
+
+    fn draw_hover_text(
+        cx: &mut crate::TestAppContext,
+        window: crate::WindowHandle<HoverText>,
+    ) -> bool {
+        let rendered = window
+            .update(cx, |view, _, _| {
+                view.tooltip_rendered.set(false);
+                view.tooltip_rendered.clone()
+            })
+            .unwrap();
+        crate::AppContext::update_window(cx, window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        rendered.get()
+    }
+
+    fn character_position(
+        cx: &mut crate::TestAppContext,
+        window: crate::WindowHandle<HoverText>,
+        index: usize,
+    ) -> Point<Pixels> {
+        window
+            .update(cx, |view, _, _| {
+                let position = view.layout.position_for_index(index).unwrap()
+                    + crate::point(crate::px(1.), crate::px(1.));
+                assert_eq!(view.layout.index_for_position(position), Ok(index));
+                position
+            })
+            .unwrap()
+    }
+
+    #[crate::test]
+    fn interactive_text_tooltip_does_not_notify_on_character_motion(
+        cx: &mut crate::TestAppContext,
+    ) {
+        for show_tooltip in [false, true] {
+            let window = cx.add_window(move |_, _| HoverText {
+                show_tooltip,
+                ..Default::default()
+            });
+            assert!(!draw_hover_text(cx, window));
+            let first = character_position(cx, window, 0);
+            let second = character_position(cx, window, 5);
+            let root = window.root(cx).unwrap();
+            let notifications = Rc::new(Cell::new(0));
+            let _subscription = cx.update(|cx| {
+                let notifications = notifications.clone();
+                cx.observe(&root, move |_, _| {
+                    notifications.set(notifications.get() + 1)
+                })
+            });
+
+            dispatch(cx, window.into(), vec![mouse_move(first)]);
+            dispatch(cx, window.into(), vec![mouse_move(second)]);
+            assert_eq!(notifications.get(), 0);
+
+            // The tooltip uses the current pointer index, not a cached hover index.
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(1));
+            cx.run_until_parked();
+            assert_eq!(draw_hover_text(cx, window), show_tooltip);
+            window
+                .update(cx, |view, _, _| {
+                    assert_eq!(*view.tooltip_indices.borrow(), [5]);
+                })
+                .unwrap();
+
+            dispatch(cx, window.into(), vec![mouse_move(first)]);
+            assert_eq!(notifications.get(), 0);
+            assert_eq!(draw_hover_text(cx, window), show_tooltip);
+            dispatch(
+                cx,
+                window.into(),
+                vec![mouse_move(crate::point(crate::px(900.), crate::px(900.)))],
+            );
+            assert!(!draw_hover_text(cx, window));
+        }
+    }
+
+    #[crate::test]
+    fn interactive_text_hover_listener_can_be_reenabled(cx: &mut crate::TestAppContext) {
+        let window = cx.add_window(|_, _| HoverText::default());
+        draw_hover_text(cx, window);
+        let first = character_position(cx, window, 0);
+        let second = character_position(cx, window, 5);
+        let hovered = window
+            .update(cx, |view, _, _| view.hovered.clone())
+            .unwrap();
+
+        dispatch(cx, window.into(), vec![mouse_move(first)]);
+        assert!(hovered.borrow().is_empty());
+        for enabled in [true, false, true] {
+            window
+                .update(cx, |view, _, cx| {
+                    view.hover_enabled = enabled;
+                    cx.notify();
+                })
+                .unwrap();
+            draw_hover_text(cx, window);
+            hovered.borrow_mut().clear();
+            dispatch(cx, window.into(), vec![mouse_move(first)]);
+            dispatch(cx, window.into(), vec![mouse_move(first)]);
+            dispatch(cx, window.into(), vec![mouse_move(second)]);
+            dispatch(cx, window.into(), vec![mouse_move(first)]);
+            if enabled {
+                assert_eq!(*hovered.borrow(), [Some(0), Some(5), Some(0)]);
+            } else {
+                assert!(hovered.borrow().is_empty());
+            }
+        }
+    }
+
+    #[crate::test]
+    fn interactive_text_click_ranges_keep_cursor_tracking(cx: &mut crate::TestAppContext) {
+        let window = cx.add_window(|_, _| HoverText {
+            click_enabled: true,
+            ..Default::default()
+        });
+        draw_hover_text(cx, window);
+        let link = character_position(cx, window, 0);
+        let plain = character_position(cx, window, 6);
+
+        for (position, cursor) in [
+            (plain, crate::CursorStyle::Arrow),
+            (link, crate::CursorStyle::PointingHand),
+            (plain, crate::CursorStyle::Arrow),
+        ] {
+            dispatch(cx, window.into(), vec![mouse_move(position)]);
+            crate::AppContext::update_window(cx, window.into(), |_, window, cx| {
+                // Follow the normal redraw decision instead of forcing a repaint.
+                if window.invalidator.is_dirty() {
+                    window.draw(cx).clear(cx);
+                }
+                assert_eq!(
+                    window
+                        .rendered_frame
+                        .cursor_style(window)
+                        .unwrap_or(crate::CursorStyle::Arrow),
+                    cursor
+                );
+            })
+            .unwrap();
+        }
+
+        for position in [link, plain] {
+            dispatch(cx, window.into(), vec![mouse_move(position)]);
+            dispatch(
+                cx,
+                window.into(),
+                vec![mouse_down(position), mouse_up(position)],
+            );
+        }
+        window
+            .update(cx, |view, _, _| assert_eq!(view.clicks.get(), 1))
+            .unwrap();
     }
 
     struct ClickableText(Rc<std::cell::Cell<usize>>);

@@ -84,6 +84,11 @@ draws rather than overwrite or release their storage.
 `KeyContext::parse` rejects malformed tokens and missing keys or values. Stroke
 dash lengths must be finite and nonnegative; empty or all-zero arrays draw solid strokes.
 
+`InteractiveText` tracks character hover only for hover callbacks or clickable
+text, whose link cursor is resolved during paint. Tooltip-only text uses its
+independent show/hide handlers without character-driven view notifications.
+Disabling character tracking clears its saved index before later reuse.
+
 ## Upstream tracking
 
 External support and platform crates remain pinned to the baseline above. Backport
