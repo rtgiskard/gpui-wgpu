@@ -1364,6 +1364,87 @@ fn gpu_rectangles_recording_error_retires_prepared_storage_and_recovers() -> any
 }
 
 #[test]
+fn quad_border_antialiasing_composites_translucent_colors() -> anyhow::Result<()> {
+    let viewport = size(40, 28);
+    for alpha_mode in [
+        wgpu::CompositeAlphaMode::PreMultiplied,
+        wgpu::CompositeAlphaMode::PostMultiplied,
+    ] {
+        for webgl_transport in [false, true] {
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            renderer.core = WgpuRendererCore::new(
+                &renderer.context,
+                Arc::new(WgpuAtlas::from_context(&renderer.context)),
+                wgpu::TextureFormat::Rgba8Unorm,
+                alpha_mode,
+            );
+            if webgl_transport {
+                renderer.core.use_webgl_instance_data_for_test();
+                renderer.core.update_alpha_mode(alpha_mode);
+            }
+            for border_style in [gpui::BorderStyle::Solid, gpui::BorderStyle::Dashed] {
+                for (background_alpha, border_alpha, edge, full) in [
+                    (0.0, 0.5, [32, 0, 0, 32], [128, 0, 0, 128]),
+                    (0.5, 0.5, [32, 0, 112, 143], [128, 0, 64, 191]),
+                    (0.0, 0.0, [0; 4], [0; 4]),
+                ] {
+                    let background = gpui::hsla(2.0 / 3.0, 1.0, 0.5, background_alpha);
+                    let mut scene = Scene::default();
+                    let mut bordered = quad(bounds(2.0, 2.0, 24.0, 24.0), background);
+                    bordered.border_style = border_style;
+                    bordered.border_color = gpui::hsla(0.0, 1.0, 0.5, border_alpha);
+                    bordered.border_widths = gpui::Edges {
+                        top: 2.25.into(),
+                        right: 2.25.into(),
+                        bottom: 2.25.into(),
+                        left: 2.25.into(),
+                    };
+                    scene.insert_primitive(bordered);
+
+                    // Independent source-over references use separate unbordered
+                    // quads and fixed-function GPU blending, not the shader's
+                    // internal over(). At x=4 the left border's inner edge has
+                    // quarter coverage; x=3 has full coverage. y=5 is inside a
+                    // dash, while y=7 is inside its gap.
+                    scene.insert_primitive(quad(bounds(28.0, 2.0, 12.0, 24.0), background));
+                    scene.insert_primitive(quad(
+                        bounds(28.0, 2.0, 4.0, 24.0),
+                        gpui::hsla(0.0, 1.0, 0.5, border_alpha * 0.25),
+                    ));
+                    scene.insert_primitive(quad(
+                        bounds(32.0, 2.0, 4.0, 24.0),
+                        gpui::hsla(0.0, 1.0, 0.5, border_alpha),
+                    ));
+                    scene.finish();
+                    renderer.ensure_render_target(viewport)?;
+                    let view = renderer.render_target.as_ref().unwrap().view.clone();
+                    renderer.core.render_frame(
+                        &scene,
+                        &view,
+                        viewport,
+                        alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied,
+                        wgpu::Color::TRANSPARENT,
+                    )?;
+                    let image = renderer.read_image()?;
+                    pixel(&image, 30, 5, edge);
+                    pixel(&image, 34, 5, full);
+                    pixel(&image, 4, 5, image.get_pixel(30, 5).0);
+                    pixel(&image, 3, 5, image.get_pixel(34, 5).0);
+                    pixel(&image, 12, 12, image.get_pixel(38, 12).0);
+                    if border_style == gpui::BorderStyle::Dashed {
+                        // Transparent gaps also exercise over(0-alpha, 0-alpha)
+                        // with nonzero hidden RGB in both inputs.
+                        pixel(&image, 4, 7, image.get_pixel(38, 7).0);
+                    }
+                    pixel(&image, 0, 0, [0; 4]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn gpu_rectangles_premultiplied_and_srgb_target_conventions() -> anyhow::Result<()> {
     for (format, alpha_mode, color, opacity, expected) in [
         (
