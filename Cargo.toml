@@ -7,3 +7,6 @@ gpui = { path = "crates/gpui" }
 gpui_wgpu = { path = "crates/gpui_wgpu" }
 gpui_linux = { path = "crates/gpui_linux" }
 gpui_platform = { path = "crates/gpui_platform" }
+
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task", rev = "41fd3359c75e221bd8b187a8ee361aa309c1714c" }

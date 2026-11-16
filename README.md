@@ -108,8 +108,8 @@ baseline: platform and support API migrations require a separate coordinated upd
 
 ### Reviewed upstream changes
 
-Last scanned Zed revision: `f0fa51bb510fc91f6da7ec55f3e0f317f1f975ec`
-(2026-11-14). The support-crate baseline remains
+Last scanned Zed revision: `053d91cb14b5fd138f221ec02bd76efb15e7b2af`
+(2026-11-16). The support-crate baseline remains
 `df48a139ce9c292738b523252c12f044697e673f`.
 
 | Upstream commits | Disposition |
@@ -139,11 +139,27 @@ Linux and renderer patches. Adoption and remaining candidates are recorded below
 | `bfcd5949ff82` | Measure Wayland frame signals from callback receipt; remove protocol-clock inference and its obsolete tests |
 | `c7bea343838f`, `78fde14d124d` | Review drag cursor precedence and list horizontal padding with application layout/input acceptance |
 | `4023e3c88e0a`, `22580c6e6970`, `ddb90e5e89d3`, `62682ebde9e7` | Acquire wrappers only for truncation, skip absent backgrounds, share empty features, avoid copied cache-hit text and sort tab stops lazily; preserve local window-thread caches, replay and font-run scratch |
-| `415d310e5260` | Requires coordinating the external gpui_shared_string crate, not just the four maintained crates |
+| `415d310e5260` | Preserve static string storage for static text children; pointer-fast equality remains deferred because it changes the external gpui_shared_string crate |
 | `ba490197cfb8`, `caead827d77c`, `ffe0fa29e41e`, `1d8eda94bd4d`, `be07e43ea0ad`, `d3fc053d5b62` | Separate rendering migration: clipping, paths, batching, depth and sorting interact with local materials, scene filters and replay |
 | `aff99ecc3249` | Separate retained SVG-animation migration; preserve local transformed-sprite/replay contracts |
 | `64ef8026c7bc` | Coordinated framework/Linux window-placement API migration |
 | `8e474e159887` | No change needed: local renderer already passes premultiplied-alpha state through uniforms |
+| `39467cf4b1b9` | Defer blanket IntoElement migration: it changes trait coherence for consumers and is not required for the adopted text fixes |
+
+The 2026-11-16 review scanned 21 additional Zed commits since
+`f0fa51bb510fc91f6da7ec55f3e0f317f1f975ec`. Keymap filtering and WGPU outline
+compositing affect the maintained crates; editor, worktree, terminal and support
+utility changes do not justify advancing the support-crate baseline.
+
+| Upstream commits | Disposition |
+| --- | --- |
+| `d0400aaf033a` | Match keystrokes before context predicates; preserve source precedence, disabled bindings and multi-keystroke prefix resolution |
+| `e2f00a41ac67` | Apply inner-edge border coverage before source-over compositing and guard zero combined alpha; retain local material and output-alpha handling |
+| `0cfc4a483dfa` | Pin upstream async-task at `41fd3359c75e221bd8b187a8ee361aa309c1714c` for task-waker identity; consumers must repeat the root patch documented below |
+
+The async-task pin also includes earlier upstream large-future allocation and
+polymorphization changes relative to registry 4.7.1. Public API and production
+features remain unchanged; this is not a claim of unchanged internal task layout.
 
 Cached/deferred reads are recorded per window across prepaint and paint. Opening
 a window synchronously from those callbacks suspends the enclosing recording
@@ -238,6 +254,16 @@ The dependency direction remains platform constructors to Linux adapters to the
 framework/renderer; GPUI does not acquire a runtime dependency on its platform
 adapter. Keep any required third-party patches, including Zed's nonblocking
 `calloop` revision, in the consuming application's root manifest.
+
+Task wakers must retain their stored vtable identity across clones and polls.
+Until a registry release includes that upstream fix, consuming workspace roots
+must add this entry to their existing crates.io patch table and update their
+lockfile; adopting the four GPUI patches alone does not select the fixed task code:
+
+```toml
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task", rev = "41fd3359c75e221bd8b187a8ee361aa309c1714c" }
+```
 
 The platform import preserved AccessKit, portal and credential integration and
 existing target branches/features. The portal/keyring dependency migration above
