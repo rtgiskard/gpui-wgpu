@@ -4172,6 +4172,70 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn image_effect_blurred_frame_matches_shader_at_native_scale() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new_for_msaa_comparison(true)?;
+        // Distinct top and left borders expose clamp vs reflect on both axes.
+        // BGRA green is hidden behind zero alpha throughout the right half.
+        let pixels = image::RgbaImage::from_fn(64, 64, |x, y| {
+            image::Rgba(if x >= 32 {
+                [0, 255, 0, 0]
+            } else if x < 2 {
+                [255, 0, 0, 255]
+            } else if y < 2 {
+                [96, 0, 192, 64]
+            } else {
+                [0, 0, 255, 160]
+            })
+        });
+        let source = gpui::RenderImage::new([image::Frame::new(pixels)]);
+        let upload = |renderer: &WgpuHeadlessRenderer, image: &gpui::RenderImage| {
+            image_tile(renderer, image.id.0, 64, 64, image.as_bytes(0).unwrap())
+        };
+        let tile = upload(&renderer, &source)?;
+        // Fractional taps exercise bilinear sampling in the clamp case. Integer
+        // tap offsets let the moving wave interpolate the prefiltered samples
+        // exactly, apart from the cached frame's 8-bit quantization.
+        for (edge, radius, amplitude) in [
+            (gpui::ImageBlurEdge::Clamp, 7.5, 0.0),
+            (gpui::ImageBlurEdge::Reflect, 8.0, 9.0),
+        ] {
+            let effects = gpui::ImageEffects {
+                wave_amplitude: amplitude,
+                wave_frequency: 1.0,
+                ..Default::default()
+            };
+            let direct = image_effect_scene(
+                tile,
+                gpui::ImageEffects {
+                    blur_radius: radius,
+                    ..effects
+                },
+            );
+            let filtered = source.blurred_frame(0, radius, edge).unwrap();
+            let cached = image_effect_scene(upload(&renderer, &filtered)?, effects);
+            let size = device_size(64, 64);
+            let direct = renderer.render_scene_to_image(&direct, size)?;
+            let cached = renderer.render_scene_to_image(&cached, size)?;
+            assert_pixel(&direct, 16, 32, [160, 0, 0, 160]);
+            assert_pixel(&direct, 56, 32, [0, 0, 0, 0]);
+            assert!((1..160).contains(&direct.get_pixel(32, 32).0[3]));
+            for (x, y, expected) in direct.enumerate_pixels() {
+                let actual = cached.get_pixel(x, y);
+                assert!(
+                    actual
+                        .0
+                        .iter()
+                        .zip(expected.0)
+                        .all(|(a, b)| a.abs_diff(b) <= 2),
+                    "wave amplitude {amplitude} at ({x}, {y}): cached {actual:?}, shader {expected:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn image_effect_quantization_and_paper_grain_are_composable_and_stable() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
         let tile = image_tile(&renderer, 804, 1, 1, &[110, 110, 110, 255])?;
