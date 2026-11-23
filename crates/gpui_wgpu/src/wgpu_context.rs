@@ -825,6 +825,15 @@ impl WgpuContext {
         self.dual_source_blending
     }
 
+    /// Whether `Rgba16Float` can be rendered to and sampled. WebGL2 needs
+    /// `EXT_color_buffer_float` for this; native backends and WebGPU always have it.
+    pub fn supports_half_float_render_targets(&self) -> bool {
+        self.adapter
+            .get_texture_format_features(wgpu::TextureFormat::Rgba16Float)
+            .allowed_usages
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING)
+    }
+
     pub fn color_texture_format(&self) -> wgpu::TextureFormat {
         self.color_texture_format
     }

@@ -1,5 +1,5 @@
 mod image_blur;
-pub use image_blur::ImageBlurEdge;
+pub use image_blur::{ImageBlurEdge, ImagePreblur, RenderBlurredImageParams};
 
 use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
 use smallvec::SmallVec;

@@ -1,9 +1,9 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageEffects, InspectorElementId,
-    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
-    RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Transformation,
-    Window, decode_static_image, decode_webp_image, px,
+    Entity, GlobalElementId, Hitbox, Image, ImageBlurEdge, ImageCache, ImageEffects, ImagePreblur,
+    InspectorElementId, InteractiveElement, Interactivity, IntoElement, LayoutId, Length,
+    ObjectFit, Pixels, RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled,
+    Task, Transformation, Window, decode_static_image, decode_webp_image, px,
 };
 use anyhow::Result;
 
@@ -194,6 +194,7 @@ pub struct Img {
     transformation: Option<Transformation>,
     automatic_animation_frames: bool,
     effects: ImageEffects,
+    preblur: Option<ImagePreblur>,
 }
 
 /// Create a new image element.
@@ -207,6 +208,7 @@ pub fn img(source: impl Into<ImageSource>) -> Img {
         transformation: None,
         automatic_animation_frames: true,
         effects: ImageEffects::default(),
+        preblur: None,
     }
 }
 
@@ -226,6 +228,18 @@ impl Img {
     /// Requires WGPU. Defaults preserve normal image rendering and image caching.
     pub fn with_effects(mut self, effects: ImageEffects) -> Self {
         self.effects = effects;
+        self
+    }
+
+    /// Blur each displayed frame once and cache it, instead of blurring per frame.
+    ///
+    /// The radius is in source image pixels, so the cached frame stays valid as the
+    /// element resizes; `ImageEffects::blur_radius` uses logical pixels instead.
+    /// Animate a blur with `ImageEffects::blur_radius`: every distinct radius here
+    /// derives and caches another frame. Other effects apply to the blurred frame.
+    /// See [`Window::paint_image_preblurred`](crate::Window::paint_image_preblurred).
+    pub fn with_preblur(mut self, preblur: ImagePreblur) -> Self {
+        self.preblur = Some(preblur);
         self
     }
 
@@ -564,18 +578,31 @@ impl Element for Img {
                         .object_fit
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
-                    window
-                        .paint_image_with_effects(
+                    let frame_index = layout_state.frame_index;
+                    let painted = match self.preblur {
+                        Some(preblur) => window.paint_image_preblurred(
                             bounds,
                             new_bounds,
                             corner_radii,
                             data,
-                            layout_state.frame_index,
+                            frame_index,
+                            preblur,
                             self.style.grayscale,
                             self.transformation,
                             self.effects,
-                        )
-                        .log_err();
+                        ),
+                        None => window.paint_image_with_effects(
+                            bounds,
+                            new_bounds,
+                            corner_radii,
+                            data,
+                            frame_index,
+                            self.style.grayscale,
+                            self.transformation,
+                            self.effects,
+                        ),
+                    };
+                    painted.log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {
                     replacement.paint(window, cx);
                 }
@@ -1469,6 +1496,89 @@ mod tests {
                 baseline = Some(sprite);
             }
         }
+    }
+
+    #[gpui::test]
+    fn preblurred_image_caches_once_and_is_released_with_its_image(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let image = test_image_with_size(8, 4);
+        let key = crate::AtlasKey::BlurredImage(
+            crate::RenderBlurredImageParams::new(
+                crate::RenderImageParams {
+                    image_id: image.id,
+                    frame_index: 0,
+                },
+                3.0,
+                ImageBlurEdge::Reflect,
+            )
+            .unwrap(),
+        );
+        let mut tiles = Vec::new();
+        // The second draw at another size reuses the cached frame.
+        for side in [px(40.), px(90.)] {
+            window.draw(point(px(0.), px(0.)), size(side, side), |_, _| {
+                img(ImageSource::Render(image.clone()))
+                    .size_full()
+                    .with_preblur(ImagePreblur::new(3.0, ImageBlurEdge::Reflect))
+                    .into_any_element()
+            });
+            tiles.push(window.update(|window, _| {
+                assert!(window.atlas_contains(&key));
+                window
+                    .rendered_frame
+                    .scene
+                    .polychrome_sprites
+                    .last()
+                    .unwrap()
+                    .tile
+            }));
+        }
+        assert_eq!(tiles[0], tiles[1]);
+        window.update(|window, _| {
+            window.drop_image(image.clone()).unwrap();
+            assert!(!window.atlas_contains(&key));
+        });
+
+        // An empty frame has nothing to blur; direct callers get the unblurred
+        // path instead of an error or a zero-sized GPU blur.
+        let empty = test_image_with_size(0, 4);
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        window.draw(point(px(0.), px(0.)), size(px(40.), px(40.)), {
+            let (empty, result) = (empty.clone(), result.clone());
+            move |_, _| {
+                crate::canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        *result.borrow_mut() = Some(window.paint_image_preblurred(
+                            bounds,
+                            bounds,
+                            Default::default(),
+                            empty.clone(),
+                            0,
+                            ImagePreblur::new(3.0, ImageBlurEdge::Clamp),
+                            false,
+                            None,
+                            ImageEffects::default(),
+                        ));
+                    },
+                )
+                .size_full()
+                .into_any_element()
+            }
+        });
+        assert!(result.borrow_mut().take().unwrap().is_ok());
+        window.update(|window, _| {
+            let blurred = crate::RenderBlurredImageParams::new(
+                crate::RenderImageParams {
+                    image_id: empty.id,
+                    frame_index: 0,
+                },
+                3.0,
+                ImageBlurEdge::Clamp,
+            )
+            .unwrap();
+            assert!(!window.atlas_contains(&blurred.into()));
+        });
     }
 
     #[gpui::test]

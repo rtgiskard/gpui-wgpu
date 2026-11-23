@@ -2,12 +2,13 @@ use anyhow::{Context as _, Result};
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
-    AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size,
+    AtlasTile, Bounds, DevicePixels, ImageBlurEdge, PlatformAtlas, Point, RenderBlurredImageParams,
+    Size,
 };
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
 
-use crate::WgpuContext;
+use crate::{WgpuContext, image_preblur::ImagePreblur};
 
 fn device_size_to_etagere(size: Size<DevicePixels>) -> etagere::Size {
     size2(size.width.0, size.height.0)
@@ -30,6 +31,10 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     next_texture_generation: u64,
     uploads_pending: bool,
+    // Separable preblur keeps its intermediate in `Rgba16Float`.
+    half_float_render_targets: bool,
+    // Created on first use for this device.
+    preblur: Option<ImagePreblur>,
 }
 
 pub struct WgpuTextureInfo {
@@ -43,6 +48,7 @@ impl WgpuAtlas {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         color_texture_format: wgpu::TextureFormat,
+        half_float_render_targets: bool,
     ) -> Self {
         let max_texture_size = device.limits().max_texture_dimension_2d;
         WgpuAtlas(Mutex::new(AtlasState::new(WgpuAtlasTextures {
@@ -53,6 +59,8 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             next_texture_generation: 0,
             uploads_pending: false,
+            half_float_render_targets,
+            preblur: None,
         })))
     }
 
@@ -61,7 +69,17 @@ impl WgpuAtlas {
             context.device.clone(),
             context.queue.clone(),
             context.color_texture_format(),
+            context.supports_half_float_render_targets(),
         )
+    }
+
+    /// Selects the separable or the single-pass preblur, as half-float render
+    /// target support would.
+    #[cfg(test)]
+    pub(crate) fn set_separable_preblur(&self, separable: bool) {
+        let mut state = self.0.lock();
+        state.backend.half_float_render_targets = separable;
+        state.backend.preblur = None;
     }
 
     /// Reset before submitting to this atlas's queue, never afterwards: a
@@ -111,8 +129,10 @@ impl WgpuAtlas {
             textures.queue = context.queue.clone();
             textures.max_texture_size = context.device.limits().max_texture_dimension_2d;
             textures.color_texture_format = context.color_texture_format();
+            textures.half_float_render_targets = context.supports_half_float_render_targets();
             textures.storage = WgpuAtlasStorage::default();
             textures.uploads_pending = false;
+            textures.preblur = None;
         });
     }
 }
@@ -128,6 +148,40 @@ impl PlatformAtlas for WgpuAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.0.lock().remove(key);
+    }
+
+    fn get_or_insert_blurred_image<'a>(
+        &self,
+        params: RenderBlurredImageParams,
+        keep_source: bool,
+        build_source: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+    ) -> Result<Option<AtlasTile>> {
+        let mut state = self.0.lock();
+        state
+            .get_or_insert_tile(params.clone().into(), |state| {
+                let source_key = params.source.clone().into();
+                let source_was_cached = state.contains(&source_key);
+                let source = state
+                    .get_or_insert_with(source_key, build_source)?
+                    .context("blurred image has no source frame")?;
+                // A released source keeps no tile: the blur overwrites it in place.
+                // The allocator frees only whole buckets, so a separate target
+                // would leave the source's space pinned beside it.
+                if !keep_source && !source_was_cached {
+                    state.detach_source_frame(&params.source);
+                    state
+                        .backend
+                        .preblur(source, source, params.radius_texels(), params.edge);
+                    return Ok(source);
+                }
+                let backend = &mut state.backend;
+                let target = backend
+                    .allocate(source.bounds.size, AtlasTextureKind::Polychrome)
+                    .context("failed to allocate")?;
+                backend.preblur(source, target, params.radius_texels(), params.edge);
+                Ok(target)
+            })
+            .map(Some)
     }
 
     fn finish_frame(&self, scene: &gpui::Scene) {
@@ -311,6 +365,42 @@ impl WgpuAtlasTextures {
         );
         self.uploads_pending = true;
     }
+
+    fn preblur(
+        &mut self,
+        source: AtlasTile,
+        target: AtlasTile,
+        radius_texels: f32,
+        edge: ImageBlurEdge,
+    ) {
+        let preblur = self.preblur.get_or_insert_with(|| {
+            ImagePreblur::new(
+                &self.device,
+                self.color_texture_format,
+                self.half_float_render_targets,
+            )
+        });
+        let source_view = &self
+            .storage
+            .get(source.texture_id)
+            .expect("cached source texture exists")
+            .view;
+        let target_texture = &self
+            .storage
+            .get(target.texture_id)
+            .expect("allocated atlas texture exists")
+            .texture;
+        preblur.blur(
+            &self.device,
+            &self.queue,
+            source_view,
+            target_texture,
+            source,
+            target,
+            radius_texels,
+            edge,
+        );
+    }
 }
 
 #[derive(Default)]
@@ -456,7 +546,7 @@ mod tests {
     #[test]
     fn rejected_insertions_preserve_pages_tiles_and_reusable_slots() -> anyhow::Result<()> {
         let (device, queue) = test_device_and_queue()?;
-        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm, true);
         let mut state = atlas.0.lock();
         let backend = &mut state.backend;
         // Keep the regression bounded and exercise shelf rounding at an odd limit.
@@ -528,7 +618,7 @@ mod tests {
     #[test]
     fn remove_deallocates_tile_space_for_reuse() -> anyhow::Result<()> {
         let (device, queue) = test_device_and_queue()?;
-        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm, true);
 
         let small = Size {
             width: DevicePixels(64),
@@ -573,7 +663,7 @@ mod tests {
     #[test]
     fn reused_texture_id_has_new_generation() -> anyhow::Result<()> {
         let (device, queue) = test_device_and_queue()?;
-        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm, true);
         let size = Size {
             width: DevicePixels(700),
             height: DevicePixels(700),

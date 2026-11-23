@@ -63,6 +63,31 @@ Native Metal rejects nondefault image effects explicitly rather than silently
 substituting a different effect. The low-level equivalent is
 `Window::paint_image_with_effects`.
 
+A static blur can instead be applied once per image frame with
+`img(source).with_preblur(ImagePreblur::new(radius_texels, edge))`, or the low-level
+`Window::paint_image_preblurred`. The radius is in source image pixels, not
+logical pixels, so the cached frame survives element resizes; `edge` is
+`ImageBlurEdge::Clamp` or `Reflect`. The same Gaussian is evaluated at the
+image's native resolution and cached as a separate atlas tile, keyed by image,
+frame, radius and edge. It matches the per-frame shader blur at native scale
+within 8-bit rounding, so later frames sample one texel instead of 81 bilinear
+taps; other `ImageEffects` (for example a wave) then apply to the blurred frame.
+Each distinct radius caches another frame, so animate blur with
+`ImageEffects::blur_radius` instead. A zero radius or an empty frame paints the
+unblurred image.
+
+WGPU derives the tile on the GPU from the cached source frame, as a horizontal
+and a vertical pass through an `Rgba16Float` intermediate; devices that cannot
+render to that format (WebGL2 without `EXT_color_buffer_float`) use the direct
+81-tap pass instead. A source frame uploaded for the blur stays cached by
+default, so other radii and the unblurred image need no re-upload;
+`ImagePreblur::release_source()` blurs it in place instead, leaving one tile per
+displayed frame. Other atlases fill the tile from `RenderImage::blurred_frame`
+on the CPU during paint and never cache the source. Dropping the image releases
+the source and every blurred tile derived from it. `RenderImage::blurred_frame`
+is also usable directly, for example on a background executor, to obtain a new
+`RenderImage`.
+
 ### Ordered scene filters (WGPU)
 
 `div().backdrop_blur(px(sigma))` captures the pixels already painted beneath

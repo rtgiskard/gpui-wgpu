@@ -1,7 +1,7 @@
 //! The material sprite's separable 9×9 Gaussian, evaluated at source texel centers.
 use std::sync::Arc;
 
-use super::RenderImage;
+use super::{RenderImage, RenderImageParams};
 use image::RgbaImage;
 
 // Positive half (including zero) of GPUI's normalized +/-3 sigma quadrature.
@@ -23,6 +23,66 @@ pub enum ImageBlurEdge {
     Reflect,
 }
 
+/// A cached blur for one painted image frame; see
+/// [`Window::paint_image_preblurred`](crate::Window::paint_image_preblurred).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImagePreblur {
+    /// Gaussian support radius in source image pixels.
+    pub radius_texels: f32,
+    /// How the blur samples beyond the outermost texels.
+    pub edge: ImageBlurEdge,
+    /// Whether a source frame that deriving the blur had to upload stays cached.
+    pub keep_source: bool,
+}
+
+impl ImagePreblur {
+    /// Keeps a source frame uploaded to derive the blur, so other radii or edge
+    /// modes, and painting the unblurred frame, need no re-upload.
+    pub fn new(radius_texels: f32, edge: ImageBlurEdge) -> Self {
+        Self {
+            radius_texels,
+            edge,
+            keep_source: true,
+        }
+    }
+
+    /// Blurs a source frame that deriving the blur had to upload in place, leaving
+    /// one atlas tile per blurred frame. Deriving another radius or edge mode, or
+    /// painting the unblurred frame, then uploads the source again. A source frame
+    /// that was already cached, for example because it is painted elsewhere, is kept.
+    pub fn release_source(mut self) -> Self {
+        self.keep_source = false;
+        self
+    }
+}
+
+/// Sprite atlas key for one image frame blurred with the material sprite's kernel.
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub struct RenderBlurredImageParams {
+    /// The unblurred source frame.
+    pub source: RenderImageParams,
+    radius_bits: u32,
+    /// How the blur samples beyond the outermost texels.
+    pub edge: ImageBlurEdge,
+}
+
+impl RenderBlurredImageParams {
+    /// Returns `None` for a negative or non-finite radius.
+    pub fn new(source: RenderImageParams, radius_texels: f32, edge: ImageBlurEdge) -> Option<Self> {
+        (radius_texels.is_finite() && radius_texels >= 0.0).then(|| Self {
+            source,
+            // Adding zero folds -0.0 into the +0.0 key.
+            radius_bits: (radius_texels + 0.0).to_bits(),
+            edge,
+        })
+    }
+
+    /// Gaussian support radius in source texels.
+    pub fn radius_texels(&self) -> f32 {
+        f32::from_bits(self.radius_bits)
+    }
+}
+
 impl RenderImage {
     /// Blur one frame on the CPU using the material sprite's Gaussian kernel.
     /// The result has a fresh image ID and preserves the source dimensions and scale.
@@ -31,12 +91,29 @@ impl RenderImage {
     /// This runs synchronously on one thread and costs roughly 34 weighted row passes
     /// over the frame, so call it on a background executor for large images. Cache the
     /// returned image: each call has a new ID, which the renderer uploads to the atlas again.
+    /// [`Window::paint_image_preblurred`](crate::Window::paint_image_preblurred) caches
+    /// the same result in the sprite atlas instead, deriving it on the GPU when possible.
     pub fn blurred_frame(
         &self,
         frame_index: usize,
         radius_texels: f32,
         edge: ImageBlurEdge,
     ) -> Option<Arc<RenderImage>> {
+        let (width, height) = self.data.get(frame_index)?.buffer().dimensions();
+        let pixels = self.blurred_frame_pixels(frame_index, radius_texels, edge)?;
+        let frame = RgbaImage::from_raw(width, height, pixels)?;
+        let mut result = RenderImage::new([image::Frame::new(frame)]);
+        result.scale_factor = self.scale_factor;
+        Some(Arc::new(result))
+    }
+
+    /// The BGRA pixels of [`Self::blurred_frame`], without wrapping them in a new image.
+    pub(crate) fn blurred_frame_pixels(
+        &self,
+        frame_index: usize,
+        radius_texels: f32,
+        edge: ImageBlurEdge,
+    ) -> Option<Vec<u8>> {
         let buffer = self.data.get(frame_index)?.buffer();
         let (width, height) = buffer.dimensions();
         if width == 0 || height == 0 || !radius_texels.is_finite() || radius_texels < 0.0 {
@@ -44,17 +121,13 @@ impl RenderImage {
         }
         // ImageBuffer can wrap storage larger than its logical pixel extent.
         let len = width as usize * height as usize * 4;
-        let pixels = dispatch(
+        Some(dispatch(
             &buffer.as_raw()[..len],
             width as usize,
             height as usize,
             radius_texels,
             edge == ImageBlurEdge::Reflect,
-        );
-        let frame = RgbaImage::from_raw(width, height, pixels)?;
-        let mut result = RenderImage::new([image::Frame::new(frame)]);
-        result.scale_factor = self.scale_factor;
-        Some(Arc::new(result))
+        ))
     }
 }
 
@@ -395,13 +468,26 @@ mod tests {
                     .is_none()
             );
         }
+        let params = RenderImageParams {
+            image_id: source.id,
+            frame_index: 0,
+        };
         for radius in [-1., f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(
                 source
                     .blurred_frame(0, radius, ImageBlurEdge::Clamp)
                     .is_none()
             );
+            assert!(
+                RenderBlurredImageParams::new(params.clone(), radius, ImageBlurEdge::Clamp)
+                    .is_none()
+            );
         }
+        // Both zero signs name one atlas entry.
+        assert!(
+            RenderBlurredImageParams::new(params.clone(), -0.0, ImageBlurEdge::Clamp)
+                == RenderBlurredImageParams::new(params, 0.0, ImageBlurEdge::Clamp)
+        );
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

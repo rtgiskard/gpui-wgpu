@@ -40,9 +40,9 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
     FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
     LineLayout, MissingGlyphSink, Pixels, PlatformGestures, PlatformInput, Point, Priority,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
-    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea,
-    hash, point, px, size,
+    RenderBlurredImageParams, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, Window,
+    WindowControlArea, hash, point, px, size,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -62,7 +62,6 @@ use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::ops;
@@ -1708,6 +1707,7 @@ pub enum AtlasKey {
     Glyph(RenderGlyphParams),
     Svg(RenderSvgParams),
     Image(RenderImageParams),
+    BlurredImage(RenderBlurredImageParams),
 }
 
 impl AtlasKey {
@@ -1724,7 +1724,7 @@ impl AtlasKey {
                 }
             }
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
-            AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
+            AtlasKey::Image(_) | AtlasKey::BlurredImage(_) => AtlasTextureKind::Polychrome,
         }
     }
 }
@@ -1747,6 +1747,12 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
+impl From<RenderBlurredImageParams> for AtlasKey {
+    fn from(params: RenderBlurredImageParams) -> Self {
+        Self::BlurredImage(params)
+    }
+}
+
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
     /// The builder runs with the atlas locked and must not re-enter the same atlas.
@@ -1758,6 +1764,21 @@ pub trait PlatformAtlas {
     /// Invalidates a key. Window-local atlases retain its allocation while the
     /// scene supplied to `finish_frame` can still present or replay that tile.
     fn remove(&self, key: &AtlasKey);
+
+    /// Returns the tile for `params`, blurring its source frame on the GPU. The
+    /// source tile is cached under its own key; `build_source` supplies its pixels
+    /// when absent, with the atlas locked. Without `keep_source`, a source tile
+    /// cached by this call is blurred in place and keyed as the result. `Ok(None)` means
+    /// this atlas cannot derive tiles, and callers insert CPU-blurred pixels with
+    /// `get_or_insert_with`.
+    fn get_or_insert_blurred_image<'a>(
+        &self,
+        _params: RenderBlurredImageParams,
+        _keep_source: bool,
+        _build_source: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+    ) -> Result<Option<AtlasTile>> {
+        Ok(None)
+    }
 
     /// Called after the previous frame has been discarded. `scene` must contain
     /// every atlas reference that this window can present or replay next frame.
@@ -1785,6 +1806,8 @@ pub trait AtlasBackend {
 #[doc(hidden)]
 pub struct AtlasState<Backend> {
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    // Derived tiles live no longer than their source frame's key.
+    blurred_by_source: FxHashMap<RenderImageParams, SmallVec<[RenderBlurredImageParams; 1]>>,
     retired_tiles: FxHashMap<(AtlasTextureId, u32), (AtlasTile, bool)>,
     glyph_count: usize,
     low_glyph_demand_frames: u16,
@@ -1795,6 +1818,7 @@ impl<Backend> AtlasState<Backend> {
     pub fn new(backend: Backend) -> Self {
         Self {
             tiles_by_key: FxHashMap::default(),
+            blurred_by_source: FxHashMap::default(),
             retired_tiles: FxHashMap::default(),
             glyph_count: 0,
             low_glyph_demand_frames: 0,
@@ -1808,10 +1832,39 @@ impl<Backend> AtlasState<Backend> {
 
     pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
         self.tiles_by_key.clear();
+        self.blurred_by_source.clear();
         self.retired_tiles.clear();
         self.glyph_count = 0;
         self.low_glyph_demand_frames = 0;
         reset_backend(&mut self.backend);
+    }
+
+    /// Returns the cached tile for `key`, or caches the tile that `build` allocates
+    /// and fills through this state's backend.
+    pub fn get_or_insert_tile(
+        &mut self,
+        key: AtlasKey,
+        build: impl FnOnce(&mut Self) -> Result<AtlasTile>,
+    ) -> Result<AtlasTile> {
+        if let Some(tile) = self.tiles_by_key.get(&key) {
+            return Ok(*tile);
+        }
+        let tile = build(self)?;
+        self.record_insert(key, tile);
+        Ok(tile)
+    }
+
+    fn record_insert(&mut self, key: AtlasKey, tile: AtlasTile) {
+        match &key {
+            AtlasKey::Glyph(_) => self.glyph_count += 1,
+            AtlasKey::BlurredImage(params) => self
+                .blurred_by_source
+                .entry(params.source.clone())
+                .or_default()
+                .push(params.clone()),
+            AtlasKey::Svg(_) | AtlasKey::Image(_) => {}
+        }
+        self.tiles_by_key.insert(key, tile);
     }
 }
 
@@ -1827,33 +1880,55 @@ impl<Backend: AtlasBackend> AtlasState<Backend> {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        match self.tiles_by_key.entry(key) {
-            Entry::Occupied(entry) => Ok(Some(*entry.get())),
-            Entry::Vacant(entry) => {
-                profiling::scope!("new tile");
-                let Some((size, bytes)) = build()? else {
-                    return Ok(None);
-                };
-                let tile = self
-                    .backend
-                    .insert(entry.key().texture_kind(), size, bytes)?;
-                if matches!(entry.key(), AtlasKey::Glyph(_)) {
-                    self.glyph_count += 1;
-                }
-                entry.insert(tile);
-                Ok(Some(tile))
-            }
+        if let Some(tile) = self.tiles_by_key.get(&key) {
+            return Ok(Some(*tile));
         }
+        profiling::scope!("new tile");
+        let Some((size, bytes)) = build()? else {
+            return Ok(None);
+        };
+        let tile = self.backend.insert(key.texture_kind(), size, bytes)?;
+        self.record_insert(key, tile);
+        Ok(Some(tile))
     }
 
     pub fn remove(&mut self, key: &AtlasKey) {
-        if let Some(tile) = self.tiles_by_key.remove(key) {
-            if matches!(key, AtlasKey::Glyph(_)) {
-                self.glyph_count -= 1;
+        // The CPU preblur caches derived tiles without their source frame, so
+        // removing a source key releases them even when it has no tile itself.
+        if let AtlasKey::Image(params) = key {
+            for derived in self.blurred_by_source.remove(params).unwrap_or_default() {
+                if let Some(tile) = self.tiles_by_key.remove(&AtlasKey::BlurredImage(derived)) {
+                    self.retire(tile);
+                }
             }
-            self.retired_tiles
-                .insert((tile.texture_id, tile.tile_id.0), (tile, false));
         }
+        let Some(tile) = self.tiles_by_key.remove(key) else {
+            return;
+        };
+        match key {
+            AtlasKey::Glyph(_) => self.glyph_count -= 1,
+            AtlasKey::BlurredImage(params) => {
+                if let Some(derived) = self.blurred_by_source.get_mut(&params.source) {
+                    derived.retain(|cached| cached != params);
+                    if derived.is_empty() {
+                        self.blurred_by_source.remove(&params.source);
+                    }
+                }
+            }
+            AtlasKey::Svg(_) | AtlasKey::Image(_) => {}
+        }
+        self.retire(tile);
+    }
+
+    /// Forgets an image frame's key so its tile can be cached under a derived key.
+    /// Removing the frame's key later still releases the derived blurred tiles.
+    pub fn detach_source_frame(&mut self, source: &RenderImageParams) {
+        self.tiles_by_key.remove(&AtlasKey::Image(source.clone()));
+    }
+
+    fn retire(&mut self, tile: AtlasTile) {
+        self.retired_tiles
+            .insert((tile.texture_id, tile.tile_id.0), (tile, false));
     }
 
     /// Retires removed tiles absent from the only replayable scene, then reclaims
@@ -3721,6 +3796,78 @@ mod atlas_tests {
         );
         assert!(state.contains(&key));
         assert_eq!(state.backend.insert_calls, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_source_frame_retires_its_blurred_tiles() -> Result<()> {
+        let mut state = AtlasState::new(RecordingAtlasBackend::default());
+        let frame = |frame_index| RenderImageParams {
+            image_id: crate::ImageId(1),
+            frame_index,
+        };
+        let blurred = |frame_index, radius| {
+            AtlasKey::BlurredImage(
+                RenderBlurredImageParams::new(
+                    frame(frame_index),
+                    radius,
+                    crate::ImageBlurEdge::Clamp,
+                )
+                .expect("valid radius"),
+            )
+        };
+        let source = state
+            .get_or_insert_with(frame(0).into(), &mut build_tile)?
+            .context("builder should produce a tile")?;
+        // CPU-filled and backend-derived blurred tiles are tracked alike.
+        let cpu = state
+            .get_or_insert_with(blurred(0, 2.), &mut build_tile)?
+            .context("builder should produce a tile")?;
+        let gpu = state.get_or_insert_tile(blurred(0, 6.), |state| {
+            state.backend.insert(
+                AtlasTextureKind::Polychrome,
+                TILE_SIZE,
+                Cow::Borrowed(&[0; 4]),
+            )
+        })?;
+        let other_frame = state
+            .get_or_insert_with(blurred(1, 2.), &mut build_tile)?
+            .context("builder should produce a tile")?;
+        assert_eq!(
+            state.get_or_insert_tile(blurred(0, 6.), |_| anyhow::bail!("cache hit"))?,
+            gpu
+        );
+
+        state.remove(&blurred(0, 2.));
+        state.remove(&frame(0).into());
+        assert!(!state.contains(&blurred(0, 6.)));
+        assert!(state.contains(&blurred(1, 2.)));
+        state.finish_frame(&Scene::default());
+        let mut removed = std::mem::take(&mut state.backend.removed_tiles);
+        removed.sort_by_key(|tile| tile.tile_id.0);
+        assert_eq!(removed, [source, cpu, gpu]);
+
+        // The re-cached source owns no stale derived keys.
+        let recached = state
+            .get_or_insert_with(frame(0).into(), &mut build_tile)?
+            .context("builder should produce a tile")?;
+        state.remove(&frame(0).into());
+        assert!(state.contains(&blurred(1, 2.)));
+        assert_eq!(
+            state.get_or_insert_with(blurred(1, 2.), &mut build_tile)?,
+            Some(other_frame)
+        );
+
+        // The CPU fallback never caches frame 1 itself; dropping it still
+        // releases the blurred tile.
+        state.remove(&frame(1).into());
+        assert!(!state.contains(&blurred(1, 2.)));
+        state.finish_frame(&Scene::default());
+        state
+            .backend
+            .removed_tiles
+            .sort_by_key(|tile| tile.tile_id.0);
+        assert_eq!(state.backend.removed_tiles, [other_frame, recached]);
         Ok(())
     }
 

@@ -106,6 +106,7 @@ impl MsaaScratchCapacity {
 /// logic plus the storage-buffer instance transport.
 const STORAGE_BUFFER_SHADERS: &str = concat!(
     include_str!("shaders.wgsl"),
+    include_str!("image_sampling.wgsl"),
     include_str!("path_coverage.wgsl"),
     include_str!("shaders_storage.wgsl"),
 );
@@ -114,6 +115,7 @@ const STORAGE_BUFFER_SHADERS: &str = concat!(
 /// logic plus the texture-based instance transport.
 const WEBGL_SHADERS: &str = concat!(
     include_str!("shaders.wgsl"),
+    include_str!("image_sampling.wgsl"),
     include_str!("path_coverage.wgsl"),
     include_str!("shaders_webgl.wgsl"),
 );
@@ -124,6 +126,7 @@ const WEBGL_SHADERS: &str = concat!(
 const SUBPIXEL_SHADERS: &str = concat!(
     "enable dual_source_blending;\n",
     include_str!("shaders.wgsl"),
+    include_str!("image_sampling.wgsl"),
     include_str!("path_coverage.wgsl"),
     include_str!("shaders_storage.wgsl"),
     include_str!("shaders_subpixel.wgsl"),
@@ -4172,7 +4175,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn image_effect_blurred_frame_matches_shader_at_native_scale() -> anyhow::Result<()> {
+    fn image_preblur_matches_shader_at_native_scale_on_cpu_and_both_gpu_paths() -> anyhow::Result<()>
+    {
         let mut renderer = WgpuHeadlessRenderer::new_for_msaa_comparison(true)?;
         // Distinct top and left borders expose clamp vs reflect on both axes.
         // BGRA green is hidden behind zero alpha throughout the right half.
@@ -4212,25 +4216,98 @@ mod tests {
                 },
             );
             let filtered = source.blurred_frame(0, radius, edge).unwrap();
-            let cached = image_effect_scene(upload(&renderer, &filtered)?, effects);
+            let cpu = image_effect_scene(upload(&renderer, &filtered)?, effects);
+            let params = gpui::RenderBlurredImageParams::new(
+                gpui::RenderImageParams {
+                    image_id: source.id,
+                    frame_index: 0,
+                },
+                radius,
+                edge,
+            )
+            .unwrap();
+            let key = gpui::AtlasKey::from(params.clone());
             let size = device_size(64, 64);
+            // Removal retires the previous tile, so render each path before the next.
+            let render_gpu = |renderer: &mut WgpuHeadlessRenderer, separable| {
+                renderer.core.atlas.set_separable_preblur(separable);
+                renderer.sprite_atlas().remove(&key);
+                // Releasing the source must not drop one that was already cached.
+                let tile = renderer
+                    .sprite_atlas()
+                    .get_or_insert_blurred_image(params.clone(), false, &mut || {
+                        anyhow::bail!("the source frame is already cached")
+                    })?
+                    .unwrap();
+                assert!(
+                    renderer
+                        .sprite_atlas()
+                        .contains(&params.source.clone().into())
+                );
+                renderer.render_scene_to_image(&image_effect_scene(tile, effects), size)
+            };
+            let separable = render_gpu(&mut renderer, true)?;
+            let single_pass = render_gpu(&mut renderer, false)?;
             let direct = renderer.render_scene_to_image(&direct, size)?;
-            let cached = renderer.render_scene_to_image(&cached, size)?;
+            let cpu = renderer.render_scene_to_image(&cpu, size)?;
             assert_pixel(&direct, 16, 32, [160, 0, 0, 160]);
             assert_pixel(&direct, 56, 32, [0, 0, 0, 0]);
             assert!((1..160).contains(&direct.get_pixel(32, 32).0[3]));
             for (x, y, expected) in direct.enumerate_pixels() {
-                let actual = cached.get_pixel(x, y);
-                assert!(
-                    actual
-                        .0
-                        .iter()
-                        .zip(expected.0)
-                        .all(|(a, b)| a.abs_diff(b) <= 2),
-                    "wave amplitude {amplitude} at ({x}, {y}): cached {actual:?}, shader {expected:?}"
-                );
+                // Both cached frames carry 8-bit quantization; they differ only in rounding.
+                for (name, image) in [
+                    ("cpu", &cpu),
+                    ("separable", &separable),
+                    ("single pass", &single_pass),
+                ] {
+                    let actual = image.get_pixel(x, y);
+                    assert!(
+                        actual
+                            .0
+                            .iter()
+                            .zip(expected.0)
+                            .all(|(a, b)| a.abs_diff(b) <= 2),
+                        "wave amplitude {amplitude} at ({x}, {y}): {name} {actual:?}, shader {expected:?}"
+                    );
+                }
+                for gpu in [&separable, &single_pass] {
+                    let (cpu, gpu) = (cpu.get_pixel(x, y), gpu.get_pixel(x, y));
+                    assert!(
+                        cpu.0.iter().zip(gpu.0).all(|(a, b)| a.abs_diff(b) <= 1),
+                        "wave amplitude {amplitude} at ({x}, {y}): cpu {cpu:?}, gpu {gpu:?}"
+                    );
+                }
             }
         }
+        // Released on request when only the blur cached it; the blurred frame
+        // still renders and dropping the image still releases it.
+        let other = gpui::RenderImage::new([image::Frame::new(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([0, 0, 255, 255]),
+        ))]);
+        let frame = gpui::RenderImageParams {
+            image_id: other.id,
+            frame_index: 0,
+        };
+        let params =
+            gpui::RenderBlurredImageParams::new(frame.clone(), 2.0, gpui::ImageBlurEdge::Clamp)
+                .unwrap();
+        let atlas = renderer.sprite_atlas();
+        let tile = atlas
+            .get_or_insert_blurred_image(params.clone(), false, &mut || {
+                Ok(Some((device_size(8, 8), other.as_bytes(0).unwrap().into())))
+            })?
+            .unwrap();
+        assert!(!atlas.contains(&frame.clone().into()));
+        let image = renderer.render_scene_to_image(
+            &image_effect_scene(tile, gpui::ImageEffects::default()),
+            device_size(64, 64),
+        )?;
+        // RenderImage bytes are BGRA, so the uniform frame is opaque red.
+        assert_pixel(&image, 32, 32, [255, 0, 0, 255]);
+        atlas.remove(&frame.into());
+        assert!(!atlas.contains(&params.into()));
         Ok(())
     }
 

@@ -10,20 +10,20 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    Transformation, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size,
-    transparent_black,
+    Hsla, ImagePreblur, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderBlurredImageParams, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
+    TextStyle, TextStyleRefinement, ThermalState, Transformation, TransformationMatrix, Underline,
+    UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -5484,6 +5484,121 @@ impl Window {
         transformation: Option<Transformation>,
         effects: crate::ImageEffects,
     ) -> Result<()> {
+        self.paint_image_tile(
+            bounds,
+            image_bounds,
+            corner_radii,
+            grayscale,
+            transformation,
+            effects,
+            |atlas| {
+                let params = RenderImageParams {
+                    image_id: data.id,
+                    frame_index,
+                };
+                Ok(atlas
+                    .get_or_insert_with(params.into(), &mut || {
+                        Ok(Some((
+                            data.size(frame_index),
+                            Cow::Borrowed(
+                                data.as_bytes(frame_index)
+                                    .expect("It's the caller's job to pass a valid frame index"),
+                            ),
+                        )))
+                    })?
+                    .expect("Callback above only returns Some"))
+            },
+        )
+    }
+
+    /// Paint an image frame pre-blurred with the material sprite's Gaussian kernel,
+    /// as [`RenderImage::blurred_frame`] computes it at the image's native resolution.
+    ///
+    /// The blurred frame is derived once per image, frame, radius and edge mode and
+    /// cached in the sprite atlas until the image is dropped: on the GPU when the
+    /// renderer supports it, otherwise on the CPU during this call. The GPU blur
+    /// reads the source frame from the atlas; [`ImagePreblur::keep_source`] decides
+    /// whether it stays there. `effects` then apply to the blurred frame, as in
+    /// [`Self::paint_image_with_effects`].
+    pub fn paint_image_preblurred(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        preblur: ImagePreblur,
+        grayscale: bool,
+        transformation: Option<Transformation>,
+        effects: crate::ImageEffects,
+    ) -> Result<()> {
+        let source = RenderImageParams {
+            image_id: data.id,
+            frame_index,
+        };
+        let params = RenderBlurredImageParams::new(source, preblur.radius_texels, preblur.edge)
+            .context("preblur radius must be finite and non-negative")?;
+        let size = data.size(frame_index);
+        // An empty frame has nothing to blur; paint it exactly like an unblurred one.
+        if params.radius_texels() == 0.0 || size.width.0 <= 0 || size.height.0 <= 0 {
+            return self.paint_image_with_effects(
+                bounds,
+                image_bounds,
+                corner_radii,
+                data,
+                frame_index,
+                grayscale,
+                transformation,
+                effects,
+            );
+        }
+        self.paint_image_tile(
+            bounds,
+            image_bounds,
+            corner_radii,
+            grayscale,
+            transformation,
+            effects,
+            |atlas| {
+                let mut source_pixels = || {
+                    Ok(Some((
+                        size,
+                        Cow::Borrowed(
+                            data.as_bytes(frame_index)
+                                .expect("It's the caller's job to pass a valid frame index"),
+                        ),
+                    )))
+                };
+                if let Some(tile) = atlas.get_or_insert_blurred_image(
+                    params.clone(),
+                    preblur.keep_source,
+                    &mut source_pixels,
+                )? {
+                    return Ok(tile);
+                }
+                // Atlases that cannot derive tiles cache the same blur from the CPU.
+                Ok(atlas
+                    .get_or_insert_with(params.into(), &mut || {
+                        let pixels = data
+                            .blurred_frame_pixels(frame_index, preblur.radius_texels, preblur.edge)
+                            .context("image frame is missing or empty")?;
+                        Ok(Some((size, Cow::Owned(pixels))))
+                    })?
+                    .expect("Callback above only returns Some"))
+            },
+        )
+    }
+
+    fn paint_image_tile(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        grayscale: bool,
+        transformation: Option<Transformation>,
+        effects: crate::ImageEffects,
+        tile: impl FnOnce(&dyn PlatformAtlas) -> Result<AtlasTile>,
+    ) -> Result<()> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         anyhow::ensure!(
             effects == crate::ImageEffects::default(),
@@ -5499,24 +5614,7 @@ impl Window {
             return Ok(());
         }
 
-        let params = RenderImageParams {
-            image_id: data.id,
-            frame_index,
-        };
-
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(params.into(), &mut || {
-                Ok(Some((
-                    data.size(frame_index),
-                    Cow::Borrowed(
-                        data.as_bytes(frame_index)
-                            .expect("It's the caller's job to pass a valid frame index"),
-                    ),
-                )))
-            })?
-            .expect("Callback above only returns Some");
-
+        let tile = tile(&*self.sprite_atlas)?;
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
         // Use the same geometry for the pivot and the GPU sprite. A logical
         // center can differ by a fraction of a device pixel after edge snapping,
@@ -5658,6 +5756,11 @@ impl Window {
                     .into(),
                 )
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn atlas_contains(&self, key: &crate::AtlasKey) -> bool {
+        self.sprite_atlas.contains(key)
     }
 
     /// Add a node to the layout tree for the current frame. Takes the `Style` of the element for which

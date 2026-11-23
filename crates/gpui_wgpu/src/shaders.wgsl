@@ -1312,48 +1312,6 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     return out;
 }
 
-// Interpolate in premultiplied space so transparent source RGB cannot fringe.
-// Clamp before conversion to integer coordinates: no tap may leave this tile.
-fn image_premultiplied_texel(position: vec2<i32>) -> vec4<f32> {
-    let color = textureLoad(t_sprite, position, 0);
-    return vec4<f32>(color.rgb * color.a, color.a);
-}
-
-fn image_premultiplied_sample(position: vec2<f32>, bounds: AtlasBounds) -> vec4<f32> {
-    let maximum = bounds.origin + max(bounds.size, vec2<i32>(1)) - vec2<i32>(1);
-    let texel = clamp(position - vec2<f32>(0.5), vec2<f32>(bounds.origin), vec2<f32>(maximum));
-    let base = vec2<i32>(floor(texel));
-    let next = min(base + vec2<i32>(1), maximum);
-    let fraction = fract(texel);
-    var top = image_premultiplied_texel(base);
-    if (fraction.x > 0.0) {
-        top = mix(top, image_premultiplied_texel(vec2<i32>(next.x, base.y)), fraction.x);
-    }
-    // Exact texel centers and clamped/one-pixel axes need no duplicate loads.
-    if (fraction.y == 0.0) {
-        return top;
-    }
-    var bottom = image_premultiplied_texel(vec2<i32>(base.x, next.y));
-    if (fraction.x > 0.0) {
-        bottom = mix(bottom, image_premultiplied_texel(next), fraction.x);
-    }
-    return mix(top, bottom, fraction.y);
-}
-
-fn image_straight_alpha(color: vec4<f32>) -> vec4<f32> {
-    if (color.a > 0.0) {
-        return vec4<f32>(color.rgb / color.a, color.a);
-    }
-    return vec4<f32>(0.0);
-}
-
-fn image_reflect(position: vec2<f32>, bounds: AtlasBounds) -> vec2<f32> {
-    let minimum = vec2<f32>(bounds.origin) + vec2<f32>(0.5);
-    let extent = max(vec2<f32>(bounds.size) - vec2<f32>(1.0), vec2<f32>(0.000001));
-    // Triangular repeat is continuous at both boundaries, including negative UVs.
-    return minimum + (vec2<f32>(1.0) - abs(fract((position - minimum) / (2.0 * extent)) * 2.0 - vec2<f32>(1.0))) * extent;
-}
-
 fn image_effect_sample(sprite: PolychromeSprite, position: vec2<f32>, local_uv: vec2<f32>) -> vec4<f32> {
     var center = position;
     let texels_per_pixel = vec2<f32>(sprite.tile.bounds.size) / max(sprite.bounds.size, vec2<f32>(0.000001));
@@ -1363,20 +1321,8 @@ fn image_effect_sample(sprite: PolychromeSprite, position: vec2<f32>, local_uv: 
     }
     var result = vec4<f32>(0.0);
     if (sprite.effects.blur_radius > 0.0) {
-        // Fixed 9x9 Gaussian quadrature over +/-3 sigma. Bounded 324 texel
-        // reads; no offscreen texture, source decode or per-frame image upload.
-        let weights = array<f32, 9>(0.0033257271, 0.0238179220, 0.0971919923, 0.2259781525, 0.2993724122, 0.2259781525, 0.0971919923, 0.0238179220, 0.0033257271);
-        for (var y = -4; y <= 4; y += 1) {
-            for (var x = -4; x <= 4; x += 1) {
-                let offset = vec2<f32>(f32(x), f32(y)) * 0.25;
-                let weight = weights[u32(x + 4)] * weights[u32(y + 4)];
-                var sample_position = center + offset * sprite.effects.blur_radius * texels_per_pixel;
-                if (sprite.effects.wave_amplitude != 0.0) {
-                    sample_position = image_reflect(sample_position, sprite.source_tile_bounds);
-                }
-                result += image_premultiplied_sample(sample_position, sprite.source_tile_bounds) * weight;
-            }
-        }
+        // No offscreen texture, source decode or per-frame image upload.
+        result = image_gaussian(center, sprite.effects.blur_radius * texels_per_pixel, sprite.effects.wave_amplitude != 0.0, sprite.source_tile_bounds);
     } else {
         result = image_premultiplied_sample(center, sprite.source_tile_bounds);
     }
