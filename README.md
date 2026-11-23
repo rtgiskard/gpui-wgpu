@@ -167,6 +167,7 @@ The following backports were selected from Zed through `f126950f9d3b62666f97437a
 | --- | --- |
 | `9f1c56d6f2` | Keep empty shadow bounds empty during pixel rounding. Cull inset shadows using the element bounds so a collapsed hole still leaves a visible shadow. |
 | `5b282ac8bb` | Simulate scale-factor changes in `HeadlessAppContext` for screenshot tests at fractional scales. |
+| `925ee76e1b` | Remove redundant iterator, inspector, and Wayland pointer-entry code and obsolete lint attributes in GPUI and its Linux backend. |
 
 Cached/deferred reads are recorded per window across prepaint and paint. Opening
 a window synchronously from those callbacks suspends the enclosing recording
