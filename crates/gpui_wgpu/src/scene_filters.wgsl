@@ -8,6 +8,10 @@ struct FilterParams {
     mode: u32,
     pad: u32,
 }
+
+// Large backdrops blur a grid of 4x4 blocks. Keep in sync with scene_filters.rs.
+const DOWNSAMPLE: f32 = 4.0;
+
 @group(0) @binding(0) var<uniform> params: FilterParams;
 @group(0) @binding(1) var source: texture_2d<f32>;
 @group(0) @binding(2) var source_sampler: sampler;
@@ -35,10 +39,34 @@ struct FilterParams {
         return mix(backdrop, color, mask);
     }
     if outside { discard; }
+    if params.mode == 4u {
+        // Average a 4x4 block with four bilinear fetches. The guard cells on each
+        // edge hold the exact border line, so clamped blur taps replicate it.
+        let cell = floor(p);
+        let base = (cell - vec2<f32>(1.0)) * DOWNSAMPLE;
+        let last = ceil(params.viewport / DOWNSAMPLE);
+        let border_low = cell < vec2<f32>(1.0);
+        let border_high = cell > last;
+        let border = select(vec2<f32>(0.5), params.viewport - vec2<f32>(0.5), border_high);
+        let a = select(base + vec2<f32>(1.0), border, border_low | border_high);
+        let b = select(base + vec2<f32>(3.0), border, border_low | border_high);
+        let color = textureSampleLevel(source, source_sampler, a / params.viewport, 0.0)
+            + textureSampleLevel(source, source_sampler, vec2<f32>(b.x, a.y) / params.viewport, 0.0)
+            + textureSampleLevel(source, source_sampler, vec2<f32>(a.x, b.y) / params.viewport, 0.0)
+            + textureSampleLevel(source, source_sampler, b / params.viewport, 0.0);
+        return color * 0.25;
+    }
+    if params.mode == 5u {
+        // Grid cell g + 1 covers full-resolution pixels [4g, 4g + 4).
+        let grid = p / DOWNSAMPLE + vec2<f32>(1.0);
+        return textureSampleLevel(source, source_sampler, grid / vec2<f32>(textureDimensions(source)), 0.0);
+    }
     if params.mode == 1u {
         // Preserve the discrete three-sigma kernel. A linear fetch at the
-        // weighted offset combines two neighboring taps, including at clamped
-        // viewport edges; no downsampling or extra target is needed.
+        // weighted offset combines two neighboring taps. The viewport is the
+        // sampled extent, which may be smaller than the source texture.
+        let size = vec2<f32>(textureDimensions(source));
+        let last_center = params.viewport - vec2<f32>(0.5);
         let radius = i32(ceil(params.sigma * 3.0));
         var color = vec4<f32>(0.0);
         var total = 0.0;
@@ -55,8 +83,8 @@ struct FilterParams {
             // zero by zero or issue a fetch whose contribution is zero.
             if weight > 0.0 {
                 let offset = x + second / weight;
-                let uv = (p + params.direction * offset) / params.viewport;
-                color += textureSampleLevel(source, source_sampler, uv, 0.0) * weight;
+                let sample_pos = min(p + params.direction * offset, last_center);
+                color += textureSampleLevel(source, source_sampler, sample_pos / size, 0.0) * weight;
                 total += weight;
             }
         }

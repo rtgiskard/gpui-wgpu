@@ -414,7 +414,8 @@ pub enum SceneFilter {
         bounds: Bounds<ScaledPixels>,
         /// Inherited content clipping.
         clip: Bounds<ScaledPixels>,
-        /// Gaussian standard deviation, at most 32 physical pixels.
+        /// Gaussian standard deviation, at most 32 physical pixels. From 8 up, the
+        /// renderer approximates it on a 4x downsampled grid.
         sigma: f32,
         /// Accumulated element opacity used to mix the blur with the original backdrop.
         opacity: f32,

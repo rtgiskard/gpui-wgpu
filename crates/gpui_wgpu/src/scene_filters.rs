@@ -5,7 +5,15 @@ use std::num::NonZeroU64;
 
 const MAX_DEPTH: usize = gpui::SceneFilterLimits::MAX_DEPTH;
 const MAX_FILTERS: usize = 64;
-const PARAM_SLOTS: u64 = (MAX_FILTERS * 2 + 1) as u64;
+// A downsampled backdrop blur uses four parameter slots; other filters fewer.
+const PARAM_SLOTS: u64 = (MAX_FILTERS * 4 + 1) as u64;
+// Large backdrops blur a grid of 4x4 blocks. Keep in sync with scene_filters.wgsl.
+const DOWNSAMPLE: f32 = 4.;
+
+/// Grid cells covering the viewport plus one border guard cell on each edge.
+fn grid_size(dimensions: [u32; 2]) -> [u32; 2] {
+    dimensions.map(|dimension| dimension.div_ceil(DOWNSAMPLE as u32) + 2)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -110,12 +118,19 @@ impl ScenePreparation {
                 .iter()
                 .all(|&dimension| dimension <= device.limits().max_texture_dimension_2d);
             if within_filter_limits {
+                let [grid_width, grid_height] = grid_size(dimensions);
+                let grid_texels = if has_backdrop {
+                    u64::from(grid_width) * u64::from(grid_height)
+                } else {
+                    0
+                };
                 let bytes = u64::from(dimensions[0])
                     .checked_mul(u64::from(dimensions[1]))
-                    .and_then(|bytes| {
-                        bytes.checked_mul(format.block_copy_size(None).unwrap_or(16) as u64)
-                    })
-                    .and_then(|bytes| bytes.checked_mul(target_count as u64));
+                    .and_then(|texels| texels.checked_mul(target_count as u64))
+                    .and_then(|texels| texels.checked_add(grid_texels))
+                    .and_then(|texels| {
+                        texels.checked_mul(format.block_copy_size(None).unwrap_or(16) as u64)
+                    });
                 within_filter_limits =
                     bytes.is_some_and(|bytes| bytes <= scene.scene_filter_limits.max_target_bytes);
             }
@@ -162,6 +177,8 @@ pub(super) struct SceneFilters {
     // Only backdrop scenes need a sampled root; None denotes the final output.
     depth_targets: [Option<usize>; MAX_DEPTH + 1],
     scratch_index: usize,
+    // Backdrop scenes append one grid-sized target after the full-size targets.
+    grid_index: Option<usize>,
     snapshot_groups: u64,
     format: wgpu::TextureFormat,
 }
@@ -269,11 +286,12 @@ impl SceneFilters {
             uniforms,
             stride,
             next_slot: 0,
-            targets: Vec::with_capacity(MAX_DEPTH + 2),
+            targets: Vec::with_capacity(MAX_DEPTH + 3),
             size: [0; 2],
             format,
             depth_targets: [None; MAX_DEPTH + 1],
             scratch_index: 0,
+            grid_index: None,
             snapshot_groups: 0,
         }
     }
@@ -296,59 +314,77 @@ impl SceneFilters {
         self.scratch_index = preparation.max_depth + 1;
         self.snapshot_groups = preparation.snapshot_groups;
         let dimensions = [size.width.0 as u32, size.height.0 as u32];
-        let target_count = preparation.target_count;
-        if self.size != dimensions || self.targets.len() != target_count {
+        let full_count = preparation.target_count;
+        let grid_index = preparation.has_backdrop.then_some(full_count);
+        let target_count = full_count + usize::from(preparation.has_backdrop);
+        if self.size != dimensions
+            || self.targets.len() != target_count
+            || self.grid_index != grid_index
+        {
             if self.size != dimensions {
                 // Drop ownership, never destroy textures referenced by queued work.
                 self.targets.clear();
                 self.size = dimensions;
             }
-            self.targets.truncate(target_count);
-            for _ in self.targets.len()..target_count {
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("reusable scene filter target"),
-                    size: wgpu::Extent3d {
-                        width: dimensions[0],
-                        height: dimensions[1],
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: self.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                });
-                let view = texture.create_view(&Default::default());
-                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("scene filter source"),
-                    layout: &self.layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &self.uniforms,
-                                offset: 0,
-                                size: NonZeroU64::new(64),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                });
-                self.targets.push(Target {
-                    _texture: texture,
-                    view,
-                    bind_group,
-                });
+            // Never reuse the smaller grid target as a full-size target.
+            if let Some(index) = self.grid_index {
+                self.targets.truncate(index);
             }
+            self.targets.truncate(full_count);
+            for _ in self.targets.len()..full_count {
+                let target = self.create_target(device, dimensions);
+                self.targets.push(target);
+            }
+            if grid_index.is_some() {
+                let target = self.create_target(device, grid_size(dimensions));
+                self.targets.push(target);
+            }
+            self.grid_index = grid_index;
+        }
+    }
+
+    fn create_target(&self, device: &wgpu::Device, dimensions: [u32; 2]) -> Target {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("reusable scene filter target"),
+            size: wgpu::Extent3d {
+                width: dimensions[0],
+                height: dimensions[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene filter source"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniforms,
+                        offset: 0,
+                        size: NonZeroU64::new(64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        Target {
+            _texture: texture,
+            view,
+            bind_group,
         }
     }
 
@@ -357,6 +393,7 @@ impl SceneFilters {
         self.size = [0; 2];
         self.depth_targets = [None; MAX_DEPTH + 1];
         self.scratch_index = 0;
+        self.grid_index = None;
         self.snapshot_groups = 0;
         self.next_slot = 0;
     }
@@ -506,13 +543,70 @@ impl SceneFilters {
         let source = self.depth_targets[depth].expect("backdrop source target");
         let mut params = self.params(bounds, clip);
         params.sigma = sigma.clamp(0.01, 32.0);
-        params.mode = 1;
-        params.direction = [1., 0.];
-        // Vertical pass needs horizontally blurred neighbors above/below panel.
-        let halo = (params.sigma * 3.0).ceil() + 1.0;
-        params.clip[1] = (params.clip[1] - halo).max(0.);
-        params.clip[3] = (params.clip[3] + halo).min(params.viewport[1]);
+        let output_clip = params.clip;
+        let destination = self.targets[source].view.clone();
         let scratch = self.targets[self.scratch_index].view.clone();
+        // The scratch target holds the grid in its top-left corner, so it must fit.
+        let grid = grid_size(self.size).map(|cells| cells as f32);
+        if params.sigma < 2. * DOWNSAMPLE
+            || grid
+                .iter()
+                .zip(params.viewport)
+                .any(|(&cells, extent)| cells > extent)
+        {
+            params.mode = 1;
+            params.direction = [1., 0.];
+            // Vertical pass needs horizontally blurred neighbors above/below panel.
+            let halo = (params.sigma * 3.0).ceil() + 1.0;
+            params.clip[1] = (params.clip[1] - halo).max(0.);
+            params.clip[3] = (params.clip[3] + halo).min(params.viewport[1]);
+            self.draw(
+                encoder,
+                queue,
+                source,
+                source,
+                &scratch,
+                params,
+                Composite::Replace,
+            );
+            params.clip = output_clip;
+            params.direction = [0., 1.];
+            // Blend against the unchanged destination, including its alpha. This
+            // avoids sampling the render attachment or allocating another target.
+            let scratch = self.scratch_index;
+            self.draw(
+                encoder,
+                queue,
+                scratch,
+                scratch,
+                &destination,
+                params,
+                Composite::Mix(opacity),
+            );
+            return;
+        }
+        // Approximate the Gaussian on a 4x downsampled grid: box downsample,
+        // separable blur, then bilinear upsample. Subtract the box variance.
+        let grid_index = self.grid_index.expect("backdrop grid target");
+        let grid_view = self.targets[grid_index].view.clone();
+        let box_variance = (DOWNSAMPLE * DOWNSAMPLE - 1.) / 12.;
+        let grid_sigma = (params.sigma * params.sigma - box_variance).sqrt() / DOWNSAMPLE;
+        let radius = (grid_sigma * 3.).ceil() + 1.;
+        // Grid cell g + 1 covers pixels [4g, 4g + 4); the upsample reads one more cell.
+        let cells = |halo: [f32; 2]| {
+            let mut cells = [0.; 4];
+            for axis in 0..2 {
+                cells[axis] = (output_clip[axis] / DOWNSAMPLE - halo[axis])
+                    .floor()
+                    .clamp(0., grid[axis]);
+                cells[axis + 2] = (output_clip[axis + 2] / DOWNSAMPLE + 2. + halo[axis])
+                    .ceil()
+                    .clamp(0., grid[axis]);
+            }
+            cells
+        };
+        params.mode = 4;
+        params.clip = cells([radius, radius]);
         self.draw(
             encoder,
             queue,
@@ -522,16 +616,40 @@ impl SceneFilters {
             params,
             Composite::Replace,
         );
-        params.clip = self.params(bounds, clip).clip;
-        params.direction = [0., 1.];
-        let destination = self.targets[source].view.clone();
-        // Blend against the unchanged destination, including its alpha. This
-        // avoids sampling the render attachment or allocating another target.
+        let mut grid_params = params;
+        grid_params.viewport = grid;
+        grid_params.mode = 1;
+        grid_params.sigma = grid_sigma;
+        grid_params.direction = [1., 0.];
+        grid_params.clip = cells([0., radius]);
+        let scratch_index = self.scratch_index;
         self.draw(
             encoder,
             queue,
-            self.scratch_index,
-            self.scratch_index,
+            scratch_index,
+            scratch_index,
+            &grid_view,
+            grid_params,
+            Composite::Replace,
+        );
+        grid_params.direction = [0., 1.];
+        grid_params.clip = cells([0., 0.]);
+        self.draw(
+            encoder,
+            queue,
+            grid_index,
+            grid_index,
+            &scratch,
+            grid_params,
+            Composite::Replace,
+        );
+        params.mode = 5;
+        params.clip = output_clip;
+        self.draw(
+            encoder,
+            queue,
+            scratch_index,
+            scratch_index,
             &destination,
             params,
             Composite::Mix(opacity),
@@ -658,6 +776,30 @@ mod tests {
         scene
     }
 
+    fn discrete_gaussian(source: &image::RgbaImage, sigma: f32) -> image::RgbaImage {
+        let radius = (3. * sigma).ceil() as i32;
+        let weights: Vec<_> = (-radius..=radius)
+            .map(|i| (-0.5 * (f64::from(i) / f64::from(sigma)).powi(2)).exp())
+            .collect();
+        let total: f64 = weights.iter().sum();
+        let (width, height) = source.dimensions();
+        let pass = |input: &image::RgbaImage, dx: i32, dy: i32| {
+            image::RgbaImage::from_fn(width, height, |x, y| {
+                let mut sum = [0.; 4];
+                for (offset, weight) in (-radius..=radius).zip(&weights) {
+                    let sx = (x as i32 + offset * dx).clamp(0, width as i32 - 1);
+                    let sy = (y as i32 + offset * dy).clamp(0, height as i32 - 1);
+                    let pixel = input.get_pixel(sx as u32, sy as u32);
+                    for (channel, byte) in sum.iter_mut().zip(pixel.0) {
+                        *channel += weight * f64::from(byte);
+                    }
+                }
+                image::Rgba(sum.map(|value| (value / total).round() as u8))
+            })
+        };
+        pass(&pass(source, 1, 0), 0, 1)
+    }
+
     #[test]
     fn backdrop_gaussian_matches_discrete_reference_at_edges_and_small_sigma() -> Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
@@ -675,32 +817,7 @@ mod tests {
         source.finish();
         let baseline = render_transparent(&mut renderer, &source)?;
         for sigma in [0.01_f32, 0.2, 0.6, 1., 4., 7.25, 32.] {
-            let radius = (3. * sigma).ceil() as i32;
-            let weights: Vec<f64> = (-radius..=radius)
-                .map(|i| (-0.5 * (i as f64 / sigma as f64).powi(2)).exp())
-                .collect();
-            let total: f64 = weights.iter().sum();
-            let mut reference = baseline.clone();
-            for horizontal in [true, false] {
-                let previous = reference.clone();
-                for y in 0..64_i32 {
-                    for x in 0..64_i32 {
-                        for channel in 0..4 {
-                            let value: f64 = (-radius..=radius)
-                                .zip(&weights)
-                                .map(|(i, weight)| {
-                                    let sx = (x + if horizontal { i } else { 0 }).clamp(0, 63);
-                                    let sy = (y + if horizontal { 0 } else { i }).clamp(0, 63);
-                                    previous.get_pixel(sx as u32, sy as u32).0[channel] as f64
-                                        * weight
-                                })
-                                .sum();
-                            reference.get_pixel_mut(x as u32, y as u32).0[channel] =
-                                (value / total).round() as u8;
-                        }
-                    }
-                }
-            }
+            let reference = discrete_gaussian(&baseline, sigma);
             let mut scene = Scene::default();
             scene.replay(0..source.len(), &source);
             let bounds = rect(0., 0., 64., 64.);
@@ -721,6 +838,101 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn large_backdrops_match_ordered_gaussian_on_odd_clipped_viewport() -> Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let viewport = size(97, 81);
+        let bounds = rect(0., 0., 97., 81.);
+        let mut background = Scene::default();
+        background.insert_primitive(quad(rect(0., 0., 35., 81.), gpui::red()));
+        let mut blue = gpui::blue();
+        blue.a = 0.55;
+        background.insert_primitive(quad(rect(20., 37., 77., 44.), blue));
+        // Both stripe orientations expose aliasing against the 4x downsampled grid.
+        for x in (44..88).step_by(2) {
+            background.insert_primitive(quad(rect(x as f32, 5., 1., 29.), gpui::white()));
+        }
+        for y in (44..73).step_by(2) {
+            background.insert_primitive(quad(rect(7., y as f32, 53., 1.), gpui::black()));
+        }
+        // Clamp-to-edge repeats these single rows for all Gaussian taps past the viewport.
+        background.insert_primitive(quad(rect(0., 0., 97., 1.), gpui::white()));
+        background.insert_primitive(quad(rect(0., 80., 97., 1.), gpui::red()));
+        background.finish();
+        let mut expected = render_transparent_at(&mut renderer, &background, viewport)?;
+        let mut scene = Scene::default();
+        scene.replay(0..background.len(), &background);
+        let clips = [rect(0., 0., 74.25, 51.75), rect(36.75, 20.25, 60.25, 60.75)];
+        let contains = |clip: Bounds<ScaledPixels>, x: u32, y: u32| {
+            let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
+            x >= clip.origin.x.0
+                && x < clip.right().0
+                && y >= clip.origin.y.0
+                && y < clip.bottom().0
+        };
+        for (stage, (clip, sigma, opacity)) in [(clips[0], 8., 1.), (clips[1], 13.5, 0.75)]
+            .into_iter()
+            .enumerate()
+        {
+            if stage == 1 {
+                // The second backdrop must capture both the first blur and this new paint.
+                scene.insert_primitive(quad(rect(53., 31., 9., 38.), gpui::white()));
+                for y in 31..69 {
+                    for x in 53..62 {
+                        expected.put_pixel(x, y, image::Rgba([255; 4]));
+                    }
+                }
+            }
+            scene.insert_filter(SceneFilter::BackdropBlur {
+                bounds,
+                clip,
+                sigma,
+                opacity,
+            });
+            let blurred = discrete_gaussian(&expected, sigma);
+            for (x, y, pixel) in expected.enumerate_pixels_mut() {
+                if contains(clip, x, y) {
+                    for (value, filtered) in pixel.0.iter_mut().zip(blurred.get_pixel(x, y).0) {
+                        *value = (f32::from(*value) * (1. - opacity)
+                            + f32::from(filtered) * opacity)
+                            .round() as u8;
+                    }
+                }
+            }
+        }
+        scene.insert_primitive(quad(rect(55., 39., 2., 8.), gpui::blue()));
+        scene.finish();
+        let actual = render_transparent_at(&mut renderer, &scene, viewport)?;
+        // Outside, first panel only, and panels including the second backdrop.
+        let mut max_error = [0u8; 3];
+        for (x, y, pixel) in actual.enumerate_pixels() {
+            if (55..57).contains(&x) && (39..47).contains(&y) {
+                assert_eq!(pixel.0, [0, 0, 255, 255], "foreground at ({x},{y})");
+                continue;
+            }
+            let region = if contains(clips[1], x, y) {
+                2
+            } else {
+                usize::from(contains(clips[0], x, y))
+            };
+            let error = pixel
+                .0
+                .iter()
+                .zip(expected.get_pixel(x, y).0)
+                .map(|(a, b)| a.abs_diff(b))
+                .max()
+                .unwrap();
+            max_error[region] = max_error[region].max(error);
+        }
+        // The 4x grid approximates the Gaussian (box prefilter, bilinear upsample);
+        // its guard cells keep the clamped border rows exact.
+        assert!(
+            max_error[0] == 0 && max_error[1] <= 5 && max_error[2] <= 5,
+            "maximum error outside/first/second: {max_error:?}"
+        );
         Ok(())
     }
 
@@ -851,7 +1063,14 @@ mod tests {
         renderer: &mut WgpuHeadlessRenderer,
         scene: &Scene,
     ) -> Result<image::RgbaImage> {
-        let size = size(64, 64);
+        render_transparent_at(renderer, scene, size(64, 64))
+    }
+
+    fn render_transparent_at(
+        renderer: &mut WgpuHeadlessRenderer,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<image::RgbaImage> {
         renderer.ensure_render_target(size)?;
         let view = renderer.render_target.as_ref().unwrap().view.clone();
         renderer
@@ -1015,8 +1234,8 @@ mod tests {
             assert_eq!(image.get_pixel(29, 2).0, [128, 0, 0, 128]);
             assert_eq!(image.get_pixel(56, 32).0, [0, 0, 0, 0]);
         }
-        // With two active groups and blur, root + groups + one spare, not
-        // another full-frame ancestor capture, are sufficient.
+        // With two active groups and blur, root + groups + one spare + the small
+        // blur grid, not another full-frame ancestor capture, are sufficient.
         assert_eq!(
             renderer
                 .core
@@ -1026,7 +1245,7 @@ mod tests {
                 .unwrap()
                 .targets
                 .len(),
-            4
+            5
         );
 
         let mut plain = translucent_scene();
@@ -1364,8 +1583,9 @@ mod tests {
         });
         source.finish();
         let filtered = renderer.render_scene_to_image(&source, size(64, 64))?;
-        let required =
-            64 * 64 * u64::from(renderer.core.target_format.block_copy_size(None).unwrap()) * 2;
+        // Root and spare full targets, plus the 18x18 downsampled blur grid.
+        let required = (64 * 64 * 2 + 18 * 18)
+            * u64::from(renderer.core.target_format.block_copy_size(None).unwrap());
         let mut replay = Scene::default();
         for budget in [required, required - 1, required] {
             replay.scene_filter_limits.max_target_bytes = budget;

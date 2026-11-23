@@ -72,8 +72,12 @@ nonpositive sigma disables the operation. This is a scene capture, distinct
 from source-only image blur; it respects the inherited content mask and cumulative
 element opacity. Fractional opacity interpolates premultiplied color and alpha
 between the original backdrop and its blurred result; zero opacity submits no blur.
-The final blur pass blends directly into the original target without an extra
-texture or render pass.
+Below 8 physical pixels the blur is an exact discrete Gaussian in two separable
+passes. From 8 up it runs on a 4x downsampled grid (box downsample, separable
+blur, bilinear upsample), with the grid sigma reduced by the box prefilter's
+variance; this stays within a few 8-bit steps of the exact kernel. The grid
+needs one small extra target, counted in `SceneFilterLimits::max_target_bytes`.
+In both cases the final pass blends directly into the original target.
 
 `div().group_edge_fade(px(width))` isolates the children, then fades their
 composed premultiplied alpha once at the top and bottom edges. Overlapping text
