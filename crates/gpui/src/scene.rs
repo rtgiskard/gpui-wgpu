@@ -235,6 +235,8 @@ impl Scene {
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let bounds = match &primitive {
+            // An inset shadow draws over the element even when its hole is empty.
+            Primitive::Shadow(shadow) if shadow.inset != 0 => shadow.element_bounds,
             #[cfg(not(target_os = "macos"))]
             Primitive::Gpu(draw) => draw.visible_bounds(),
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]

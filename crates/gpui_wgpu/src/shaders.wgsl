@@ -1008,7 +1008,9 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
 
     var alpha: f32;
-    if (shadow.blur_radius == 0.0) {
+    if (any(shadow.bounds.size <= vec2<f32>(0.0))) {
+        alpha = 0.0;
+    } else if (shadow.blur_radius == 0.0) {
         let distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
         alpha = saturate(0.5 - distance);
     } else {

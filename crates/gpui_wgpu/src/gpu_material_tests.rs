@@ -97,6 +97,71 @@ fn pixel(image: &image::RgbaImage, x: u32, y: u32, expected: [u8; 4]) {
     );
 }
 
+#[test]
+fn collapsed_shadows_render_at_fractional_scales() -> anyhow::Result<()> {
+    use gpui::{AppContext as _, BoxShadow, HeadlessAppContext, Render, Styled as _, px};
+
+    struct ShadowView;
+
+    impl Render for ShadowView {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::canvas(
+                |_, _, _| (),
+                |viewport, _, window, _| {
+                    window.paint_quad(gpui::fill(viewport, gpui::black()));
+                    for (y, blur) in [(8.25, px(0.)), (40.25, px(2.))] {
+                        let shape = |x| {
+                            Bounds::new(gpui::point(px(x), px(y)), gpui::size(px(12.), px(20.)))
+                        };
+                        let shadow = BoxShadow::new(px(0.), px(0.), gpui::red()).blur_radius(blur);
+                        window.paint_drop_shadows(
+                            shape(4.25),
+                            Default::default(),
+                            &[shadow.clone().spread_radius(px(-6.))],
+                        );
+                        for (x, spread) in [(24.25, 6.), (44.25, 7.), (64.25, 0.)] {
+                            window.paint_inset_shadows(
+                                shape(x),
+                                Default::default(),
+                                &[shadow.clone().spread_radius(px(spread)).inset()],
+                            );
+                        }
+                    }
+                },
+            )
+            .size_full()
+        }
+    }
+
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(crate::CosmicTextSystem::new_without_system_fonts("sans-serif")),
+        Arc::new(()),
+        || Ok(Some(Box::new(WgpuHeadlessRenderer::new()?))),
+    );
+    let window = cx
+        .open_window(gpui::size(px(80.), px(72.)), |_, cx| cx.new(|_| ShadowView))?
+        .into();
+    for scale in [1.25, 1.5] {
+        cx.simulate_window_scale_factor_change(window, scale);
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))?;
+        let image = cx.capture_screenshot(window)?;
+        let device = |pos: f32| (pos * scale).floor() as u32;
+        assert_eq!(image.dimensions(), (device(80.), device(72.)));
+        for y in [18.25, 50.25] {
+            pixel(&image, device(10.25), device(y), BLACK);
+            pixel(&image, device(30.25), device(y), RED);
+            pixel(&image, device(50.25), device(y), RED);
+            pixel(&image, device(70.25), device(y), BLACK);
+            pixel(&image, device(40.), device(y), BLACK);
+        }
+    }
+    Ok(())
+}
+
 fn still_water_image(
     renderer: &mut WgpuHeadlessRenderer,
     phase: f32,

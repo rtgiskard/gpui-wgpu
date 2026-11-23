@@ -161,6 +161,13 @@ The async-task pin also includes earlier upstream large-future allocation and
 polymorphization changes relative to registry 4.7.1. Public API and production
 features remain unchanged; this is not a claim of unchanged internal task layout.
 
+The following backports were selected from Zed through `f126950f9d3b62666f97437ae5d4ccac2272c4db`:
+
+| Upstream commits | Disposition |
+| --- | --- |
+| `9f1c56d6f2` | Keep empty shadow bounds empty during pixel rounding. Cull inset shadows using the element bounds so a collapsed hole still leaves a visible shadow. |
+| `5b282ac8bb` | Simulate scale-factor changes in `HeadlessAppContext` for screenshot tests at fractional scales. |
+
 Cached/deferred reads are recorded per window across prepaint and paint. Opening
 a window synchronously from those callbacks suspends the enclosing recording
 context; inner construction/draw reads do not subscribe the outer window, and

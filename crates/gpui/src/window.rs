@@ -3489,6 +3489,10 @@ impl Window {
         let scale_factor = self.scale_factor();
         let left = floor_to_device_pixel(bounds.left().0, scale_factor);
         let top = floor_to_device_pixel(bounds.top().0, scale_factor);
+        // Outward rounding can give a fractional empty region nonzero area.
+        if bounds.is_empty() {
+            return Bounds::new(point(ScaledPixels(left), ScaledPixels(top)), Size::default());
+        }
         let right = ceil_to_device_pixel(bounds.right().0, scale_factor).max(left);
         let bottom = ceil_to_device_pixel(bounds.bottom().0, scale_factor).max(top);
         Bounds::from_corners(
