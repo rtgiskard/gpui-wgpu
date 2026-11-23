@@ -15,6 +15,10 @@ fn grid_size(dimensions: [u32; 2]) -> [u32; 2] {
     dimensions.map(|dimension| dimension.div_ceil(DOWNSAMPLE as u32) + 2)
 }
 
+fn uses_downsample(sigma: f32) -> bool {
+    sigma >= 2. * DOWNSAMPLE
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
@@ -41,6 +45,7 @@ pub(super) struct ScenePreparation {
     pub has_filters: bool,
     pub has_water: bool,
     has_backdrop: bool,
+    blur_grid: Option<[u32; 2]>,
     max_depth: usize,
     target_count: usize,
     snapshot_groups: u64,
@@ -60,6 +65,7 @@ impl ScenePreparation {
                 has_filters: false,
                 has_water: false,
                 has_backdrop: false,
+                blur_grid: None,
                 max_depth: 0,
                 target_count: 0,
                 snapshot_groups: 0,
@@ -70,6 +76,7 @@ impl ScenePreparation {
         let mut count = 0;
         let mut water_count = 0;
         let mut has_backdrop = false;
+        let mut has_broad_blur = false;
         let mut group_markers = [0; MAX_DEPTH];
         let mut snapshot_groups = 0u64;
         let mut within_filter_limits = true;
@@ -93,8 +100,9 @@ impl ScenePreparation {
                             ensure!(depth > 0, "unmatched scene filter group end");
                             depth -= 1;
                         }
-                        SceneFilter::BackdropBlur { .. } => {
+                        SceneFilter::BackdropBlur { sigma, .. } => {
                             has_backdrop = true;
+                            has_broad_blur |= uses_downsample(sigma);
                             if within_filter_limits {
                                 for &marker in &group_markers[..depth] {
                                     snapshot_groups |= 1u64 << marker;
@@ -108,6 +116,7 @@ impl ScenePreparation {
         }
         ensure!(depth == 0, "unclosed scene filter group");
         let target_count = max_depth + 2 * usize::from(has_backdrop);
+        let mut blur_grid = None;
         if count != 0 {
             ensure!(
                 size.width.0 > 0 && size.height.0 > 0,
@@ -118,12 +127,15 @@ impl ScenePreparation {
                 .iter()
                 .all(|&dimension| dimension <= device.limits().max_texture_dimension_2d);
             if within_filter_limits {
-                let [grid_width, grid_height] = grid_size(dimensions);
-                let grid_texels = if has_backdrop {
-                    u64::from(grid_width) * u64::from(grid_height)
-                } else {
-                    0
-                };
+                if has_broad_blur {
+                    let grid = grid_size(dimensions);
+                    // The grid also uses the top-left corner of the full-size scratch target.
+                    if grid[0] <= dimensions[0] && grid[1] <= dimensions[1] {
+                        blur_grid = Some(grid);
+                    }
+                }
+                let grid_texels =
+                    blur_grid.map_or(0, |[width, height]| u64::from(width) * u64::from(height));
                 let bytes = u64::from(dimensions[0])
                     .checked_mul(u64::from(dimensions[1]))
                     .and_then(|texels| texels.checked_mul(target_count as u64))
@@ -139,6 +151,7 @@ impl ScenePreparation {
             has_filters: count != 0 && within_filter_limits,
             has_water: water_count != 0 && water_count <= super::cg_water::MAX_PANELS,
             has_backdrop: has_backdrop && within_filter_limits,
+            blur_grid: blur_grid.filter(|_| within_filter_limits),
             max_depth: if within_filter_limits { max_depth } else { 0 },
             target_count: if within_filter_limits {
                 target_count
@@ -177,8 +190,8 @@ pub(super) struct SceneFilters {
     // Only backdrop scenes need a sampled root; None denotes the final output.
     depth_targets: [Option<usize>; MAX_DEPTH + 1],
     scratch_index: usize,
-    // Backdrop scenes append one grid-sized target after the full-size targets.
-    grid_index: Option<usize>,
+    // When needed, the grid is the last target, after all full-size targets.
+    blur_grid: Option<[u32; 2]>,
     snapshot_groups: u64,
     format: wgpu::TextureFormat,
 }
@@ -291,7 +304,7 @@ impl SceneFilters {
             format,
             depth_targets: [None; MAX_DEPTH + 1],
             scratch_index: 0,
-            grid_index: None,
+            blur_grid: None,
             snapshot_groups: 0,
         }
     }
@@ -315,31 +328,33 @@ impl SceneFilters {
         self.snapshot_groups = preparation.snapshot_groups;
         let dimensions = [size.width.0 as u32, size.height.0 as u32];
         let full_count = preparation.target_count;
-        let grid_index = preparation.has_backdrop.then_some(full_count);
-        let target_count = full_count + usize::from(preparation.has_backdrop);
+        let blur_grid = preparation.blur_grid;
+        let target_count = full_count + usize::from(blur_grid.is_some());
         if self.size != dimensions
             || self.targets.len() != target_count
-            || self.grid_index != grid_index
+            || self.blur_grid != blur_grid
         {
-            if self.size != dimensions {
+            let previous_grid = if self.size != dimensions {
                 // Drop ownership, never destroy textures referenced by queued work.
                 self.targets.clear();
                 self.size = dimensions;
-            }
-            // Never reuse the smaller grid target as a full-size target.
-            if let Some(index) = self.grid_index {
-                self.targets.truncate(index);
-            }
+                None
+            } else if self.blur_grid.is_some() {
+                // Never reuse the smaller grid target as a full-size target.
+                self.targets.pop()
+            } else {
+                None
+            };
             self.targets.truncate(full_count);
             for _ in self.targets.len()..full_count {
                 let target = self.create_target(device, dimensions);
                 self.targets.push(target);
             }
-            if grid_index.is_some() {
-                let target = self.create_target(device, grid_size(dimensions));
-                self.targets.push(target);
+            if let Some(grid) = blur_grid {
+                self.targets
+                    .push(previous_grid.unwrap_or_else(|| self.create_target(device, grid)));
             }
-            self.grid_index = grid_index;
+            self.blur_grid = blur_grid;
         }
     }
 
@@ -393,7 +408,7 @@ impl SceneFilters {
         self.size = [0; 2];
         self.depth_targets = [None; MAX_DEPTH + 1];
         self.scratch_index = 0;
-        self.grid_index = None;
+        self.blur_grid = None;
         self.snapshot_groups = 0;
         self.next_slot = 0;
     }
@@ -546,14 +561,7 @@ impl SceneFilters {
         let output_clip = params.clip;
         let destination = self.targets[source].view.clone();
         let scratch = self.targets[self.scratch_index].view.clone();
-        // The scratch target holds the grid in its top-left corner, so it must fit.
-        let grid = grid_size(self.size).map(|cells| cells as f32);
-        if params.sigma < 2. * DOWNSAMPLE
-            || grid
-                .iter()
-                .zip(params.viewport)
-                .any(|(&cells, extent)| cells > extent)
-        {
+        let Some(grid) = self.blur_grid.filter(|_| uses_downsample(params.sigma)) else {
             params.mode = 1;
             params.direction = [1., 0.];
             // Vertical pass needs horizontally blurred neighbors above/below panel.
@@ -584,10 +592,11 @@ impl SceneFilters {
                 Composite::Mix(opacity),
             );
             return;
-        }
+        };
         // Approximate the Gaussian on a 4x downsampled grid: box downsample,
         // separable blur, then bilinear upsample. Subtract the box variance.
-        let grid_index = self.grid_index.expect("backdrop grid target");
+        let grid = grid.map(|cells| cells as f32);
+        let grid_index = self.targets.len() - 1;
         let grid_view = self.targets[grid_index].view.clone();
         let box_variance = (DOWNSAMPLE * DOWNSAMPLE - 1.) / 12.;
         let grid_sigma = (params.sigma * params.sigma - box_variance).sqrt() / DOWNSAMPLE;
@@ -1234,8 +1243,7 @@ mod tests {
             assert_eq!(image.get_pixel(29, 2).0, [128, 0, 0, 128]);
             assert_eq!(image.get_pixel(56, 32).0, [0, 0, 0, 0]);
         }
-        // With two active groups and blur, root + groups + one spare + the small
-        // blur grid, not another full-frame ancestor capture, are sufficient.
+        // Narrow blur needs the root, two group targets and one full-size scratch.
         assert_eq!(
             renderer
                 .core
@@ -1245,7 +1253,7 @@ mod tests {
                 .unwrap()
                 .targets
                 .len(),
-            5
+            4
         );
 
         let mut plain = translucent_scene();
@@ -1574,35 +1582,46 @@ mod tests {
         let mut plain = split_scene();
         plain.finish();
         let expected = renderer.render_scene_to_image(&plain, size(64, 64))?;
-        let mut source = split_scene();
-        source.insert_filter(SceneFilter::BackdropBlur {
-            bounds,
-            clip: bounds,
-            sigma: 4.,
-            opacity: 1.0,
-        });
-        source.finish();
-        let filtered = renderer.render_scene_to_image(&source, size(64, 64))?;
-        // Root and spare full targets, plus the 18x18 downsampled blur grid.
-        let required = (64 * 64 * 2 + 18 * 18)
-            * u64::from(renderer.core.target_format.block_copy_size(None).unwrap());
+        let pixel_bytes = u64::from(renderer.core.target_format.block_copy_size(None).unwrap());
+        let full_bytes = 64 * 64 * 2 * pixel_bytes;
+        let grid_bytes = 18 * 18 * pixel_bytes;
         let mut replay = Scene::default();
-        for budget in [required, required - 1, required] {
-            replay.scene_filter_limits.max_target_bytes = budget;
-            replay.clear();
-            replay.replay(0..source.len(), &source);
-            replay.finish();
-            let actual = renderer.render_scene_to_image(&replay, size(64, 64))?;
-            assert_eq!(
-                actual.as_raw(),
-                if budget == required {
-                    filtered.as_raw()
-                } else {
-                    expected.as_raw()
-                }
-            );
+        for (sigmas, required) in [
+            (&[4.][..], full_bytes),
+            (&[8.][..], full_bytes + grid_bytes),
+            (&[4., 8., 18.][..], full_bytes + grid_bytes),
+            (&[4.][..], full_bytes),
+        ] {
+            let mut source = split_scene();
+            for &sigma in sigmas {
+                source.insert_filter(SceneFilter::BackdropBlur {
+                    bounds,
+                    clip: bounds,
+                    sigma,
+                    opacity: 1.0,
+                });
+            }
+            source.finish();
+            let filtered = renderer.render_scene_to_image(&source, size(64, 64))?;
+            assert_ne!(filtered.as_raw(), expected.as_raw());
+            for budget in [required, required - 1, required] {
+                replay.scene_filter_limits.max_target_bytes = budget;
+                replay.clear();
+                replay.replay(0..source.len(), &source);
+                replay.finish();
+                let actual = renderer.render_scene_to_image(&replay, size(64, 64))?;
+                assert_eq!(
+                    actual.as_raw(),
+                    if budget == required {
+                        filtered.as_raw()
+                    } else {
+                        expected.as_raw()
+                    },
+                    "sigmas={sigmas:?}, budget={budget}"
+                );
+            }
         }
-        source.clear();
+        let mut source = Scene::default();
         for _ in 0..2 {
             source.insert_filter(SceneFilter::BeginEdgeFade {
                 bounds,
@@ -1618,7 +1637,7 @@ mod tests {
         let faded = renderer.render_scene_to_image(&source, size(64, 64))?;
         assert_ne!(faded.as_raw(), expected.as_raw());
         for depth in [1, 2, 1] {
-            replay.scene_filter_limits.max_target_bytes = required * 2;
+            replay.scene_filter_limits.max_target_bytes = full_bytes;
             replay.scene_filter_limits.max_depth = depth;
             replay.clear();
             replay.replay(0..source.len(), &source);
